@@ -20,7 +20,7 @@
 
 ## What is this?
 
-This turns a cheap ESP32 board into a wireless AirPlay 2 speaker. Plug it into any amplifier or powered speakers, and it shows up on your iPhone/iPad/Mac just like a HomePod or AirPlay TV. Works with **ESP32** and **ESP32-S3** chips, including the **[SqueezeAMP](https://github.com/philippe44/SqueezeAMP)** (ESP32 + TAS5756 DAC) and **[Esparagus Audio Brick](https://esparagus.com/)** (ESP32 + TAS5825M DAC/amp) boards with built-in amplifiers.
+This turns a cheap ESP32 board into a wireless AirPlay 2 speaker. Plug it into any amplifier or powered speakers, and it shows up on your iPhone/iPad/Mac just like a HomePod or AirPlay TV. Works with **ESP32**, **ESP32-S3**, and **ESP32-C5** chips, including the **[SqueezeAMP](https://github.com/philippe44/SqueezeAMP)** (ESP32 + TAS5756 DAC) and **[Esparagus Audio Brick](https://esparagus.com/)** (ESP32 + TAS5825M DAC/amp) boards with built-in amplifiers.
 
 ESP32 boards (SqueezeAMP, Esparagus Audio Brick) also support **Bluetooth A2DP** — stream from any phone or tablet over Bluetooth when AirPlay isn't in use. The Esparagus Audio Brick additionally supports **wired Ethernet** via an optional W5500 SPI module.
 
@@ -459,8 +459,11 @@ Secure Simple Pairing (SSP) can optionally be enabled for BT 2.1+ devices — th
 |---|---|---|
 | `squeezeamp-bt` | SqueezeAMP | AirPlay + Bluetooth |
 | `esparagus-audio-brick-bt` | Esparagus Audio Brick | AirPlay + Bluetooth + Ethernet |
+| `esp32c5-xiao` | Seeed XIAO ESP32-C5 | AirPlay (dual-band WiFi 6, no Bluetooth) |
 
 > **Note:** Bluetooth Classic is only available on the original ESP32 (not ESP32-S3). The ESP32-S3 generic build does not include Bluetooth support.
+
+> **Note:** The Seeed XIAO ESP32-C5 (RISC-V, 8 MB flash, 8 MB PSRAM) is dual-band WiFi 6 with Bluetooth LE only — it has no Bluetooth Classic, so A2DP is not available. The official `platformio/espressif32` platform does **not** support the ESP32-C5, so the `esp32c5-xiao` environment uses the community [pioarduino](https://github.com/pioarduino/platform-espressif32) platform (pinned in `platformio.ini`), which bundles ESP-IDF 5.5.x. No extra setup is needed — PlatformIO downloads it automatically on first build. Alternatively, build with the ESP-IDF native flow: `idf.py set-target esp32c5` then `idf.py -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.esp32c5" build flash monitor`. Wire an external I2S DAC (e.g. PCM5102A) to the default pins: BCK=GPIO8 (D8), WS/LRCK=GPIO9 (D9), DIN=GPIO10 (D10); adjust via `idf.py menuconfig` → Board Configuration → Pin Configuration.
 
 ---
 
