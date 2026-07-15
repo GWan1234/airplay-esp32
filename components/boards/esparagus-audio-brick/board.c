@@ -277,12 +277,21 @@ static esp_err_t init_spkfault_gpio(void) {
     return ESP_ERR_NO_MEM;
   }
 
-  // GPIO 34-39 on ESP32 are input-only with no internal pull-up;
-  // an external pull-up is required on the speaker fault pin.
+  // On classic ESP32, GPIO 34-39 are input-only with no internal pull-up,
+  // so an external pull-up is required on the speaker fault pin there.
+  // On ESP32-S3 (and other targets), the fault GPIO is a normal pin that
+  // does support an internal pull-up -- enable it so boards without an
+  // external pull-up resistor on this net (e.g. Louder-ESP32-S3-Plus,
+  // GPIO18) don't read a floating pin as a permanent false fault.
+#if CONFIG_IDF_TARGET_ESP32S3
+  gpio_pullup_t spkfault_pullup = GPIO_PULLUP_ENABLE;
+#else
+  gpio_pullup_t spkfault_pullup = GPIO_PULLUP_DISABLE;
+#endif
   gpio_config_t spkfault_cfg = {
       .pin_bit_mask = (1ULL << BOARD_SPKFAULT_GPIO),
       .mode = GPIO_MODE_INPUT,
-      .pull_up_en = GPIO_PULLUP_DISABLE,
+      .pull_up_en = spkfault_pullup,
       .pull_down_en = GPIO_PULLDOWN_DISABLE,
       .intr_type = GPIO_INTR_ANYEDGE,
   };
