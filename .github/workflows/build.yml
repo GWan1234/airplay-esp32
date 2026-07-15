@@ -29,6 +29,9 @@ jobs:
           - name: esparagus-audio-brick-bt
             target: esp32
             sdkconfig: "sdkconfig.defaults;sdkconfig.defaults.esparagus-audio-brick;sdkconfig.defaults.bt"
+          - name: esparagus-louder-s3
+            target: esp32s3
+            sdkconfig: "sdkconfig.defaults;sdkconfig.defaults.esparagus-louder-s3"
     steps:
       - uses: actions/checkout@v6
         with:
