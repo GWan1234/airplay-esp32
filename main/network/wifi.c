@@ -232,15 +232,13 @@ static void wifi_select_best_ap(const char *ssid) {
       }
     }
   }
-  if (best_5g >= 0 &&
-      (best_24 < 0 ||
-       ap_list[best_5g].rssi >= CONFIG_WIFI_PREFER_5GHZ_MIN_RSSI)) {
+  if (best_5g >= 0 && (best_24 < 0 || ap_list[best_5g].rssi >=
+                                          CONFIG_WIFI_PREFER_5GHZ_MIN_RSSI)) {
     best_idx = best_5g;
-    ESP_LOGI(TAG, "Preferring 5 GHz AP (rssi=%d, ch=%d)",
-             ap_list[best_5g].rssi, ap_list[best_5g].primary);
+    ESP_LOGI(TAG, "Preferring 5 GHz AP (rssi=%d, ch=%d)", ap_list[best_5g].rssi,
+             ap_list[best_5g].primary);
   } else if (best_5g >= 0) {
-    ESP_LOGI(TAG,
-             "5 GHz AP too weak (rssi=%d < %d), falling back to 2.4 GHz",
+    ESP_LOGI(TAG, "5 GHz AP too weak (rssi=%d < %d), falling back to 2.4 GHz",
              ap_list[best_5g].rssi, CONFIG_WIFI_PREFER_5GHZ_MIN_RSSI);
     best_idx = best_24;
   }
