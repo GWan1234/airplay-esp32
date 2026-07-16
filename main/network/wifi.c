@@ -214,6 +214,38 @@ static void wifi_select_best_ap(const char *ssid) {
     }
   }
 
+#if CONFIG_WIFI_PREFER_5GHZ
+  // Prefer the 5 GHz band when the same SSID is present on both bands.
+  // 5 GHz APs use channels above 14; 2.4 GHz uses channels 1-14. Pick the
+  // strongest AP in each band, then favour 5 GHz unless it is too weak and a
+  // 2.4 GHz AP is available (in which case 2.4 GHz is the more reliable link).
+  int best_5g = -1;
+  int best_24 = -1;
+  for (int i = 0; i < ap_count; i++) {
+    if (ap_list[i].primary > 14) {
+      if (best_5g < 0 || ap_list[i].rssi > ap_list[best_5g].rssi) {
+        best_5g = i;
+      }
+    } else {
+      if (best_24 < 0 || ap_list[i].rssi > ap_list[best_24].rssi) {
+        best_24 = i;
+      }
+    }
+  }
+  if (best_5g >= 0 &&
+      (best_24 < 0 ||
+       ap_list[best_5g].rssi >= CONFIG_WIFI_PREFER_5GHZ_MIN_RSSI)) {
+    best_idx = best_5g;
+    ESP_LOGI(TAG, "Preferring 5 GHz AP (rssi=%d, ch=%d)",
+             ap_list[best_5g].rssi, ap_list[best_5g].primary);
+  } else if (best_5g >= 0) {
+    ESP_LOGI(TAG,
+             "5 GHz AP too weak (rssi=%d < %d), falling back to 2.4 GHz",
+             ap_list[best_5g].rssi, CONFIG_WIFI_PREFER_5GHZ_MIN_RSSI);
+    best_idx = best_24;
+  }
+#endif
+
   ESP_LOGI(TAG, "Found %d APs for SSID '%s', best: " MACSTR " (rssi=%d, ch=%d)",
            ap_count, ssid, MAC2STR(ap_list[best_idx].bssid),
            ap_list[best_idx].rssi, ap_list[best_idx].primary);
