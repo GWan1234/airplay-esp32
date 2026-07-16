@@ -24,14 +24,14 @@ CONFIG_WIFI_PREFER_5GHZ=y
 # =============================================================================
 # GPIO defaults (XIAO ESP32-C5 silkscreen -> chip GPIO)
 #   D8/SCK  = GPIO8   -> I2S bit clock (BCK)
-#   D9/MISO = GPIO9   -> I2S word select (WS/LRCK)
-#   D10/MOSI= GPIO10  -> I2S data out (DIN)
+#   D10/MOSI = GPIO10   -> I2S word select (WS/LCK)
+#   D9/MISO = GPIO9  -> I2S data out (DIN)
 #   USER LED (yellow) = GPIO27
 #   ADC_BAT = GPIO6
 # Wire your external I2S DAC (e.g. PCM5102A) to these pins, or adjust here /
 # via `idf.py menuconfig` -> Board Configuration -> Pin Configuration.
 CONFIG_LED_STATUS_GPIO=27
 CONFIG_I2S_BCK_IO=8
-CONFIG_I2S_WS_IO=9
-CONFIG_I2S_DO_IO=10
+CONFIG_I2S_WS_IO=10
+CONFIG_I2S_DO_IO=9
 CONFIG_BAT_CHANNEL=6
