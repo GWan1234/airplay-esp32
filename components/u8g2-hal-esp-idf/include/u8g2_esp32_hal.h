@@ -17,7 +17,16 @@
 
 #define U8G2_ESP32_HAL_UNDEFINED GPIO_NUM_NC
 
-#if SOC_I2C_NUM > 1
+// Select the master I2C port. I2C_NUM_1 only exists on chips with more than one
+// high-power I2C peripheral. Note SOC_I2C_NUM counts LP I2C ports too (e.g. the
+// ESP32-C5/C6 have 1 HP + 1 LP = 2), so gate on SOC_HP_I2C_NUM when available.
+#if defined(SOC_HP_I2C_NUM)
+#if SOC_HP_I2C_NUM > 1
+#define I2C_MASTER_NUM I2C_NUM_1 //  I2C port number for master dev
+#else
+#define I2C_MASTER_NUM I2C_NUM_0 //  I2C port number for master dev
+#endif
+#elif SOC_I2C_NUM > 1
 #define I2C_MASTER_NUM I2C_NUM_1 //  I2C port number for master dev
 #else
 #define I2C_MASTER_NUM I2C_NUM_0 //  I2C port number for master dev

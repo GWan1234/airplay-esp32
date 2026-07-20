@@ -130,6 +130,29 @@ menu "Airplay ESP Configuration"
         default 1
         help
             Be careful you might not see the access point if you use a channel not allowed in your country.
+
+    config WIFI_PREFER_5GHZ
+        bool "Prefer 5 GHz band when joining a network"
+        default n
+        help
+            When a network with the configured SSID is available on both the
+            2.4 GHz and 5 GHz bands (dual-band routers usually share one SSID),
+            prefer connecting to the 5 GHz access point. Falls back to 2.4 GHz
+            when no 5 GHz AP is found or the 5 GHz signal is too weak.
+
+            Only chips with a dual-band radio (e.g. ESP32-C5) can use 5 GHz;
+            on 2.4 GHz-only chips this option has no effect.
+
+    config WIFI_PREFER_5GHZ_MIN_RSSI
+        int "Minimum 5 GHz RSSI to prefer (dBm)"
+        default -75
+        range -95 -30
+        depends on WIFI_PREFER_5GHZ
+        help
+            If the best 5 GHz AP is weaker than this RSSI (in dBm) and a
+            2.4 GHz AP for the same SSID is available, fall back to 2.4 GHz
+            for a more reliable link. Lower (more negative) values make the
+            receiver stick to 5 GHz even at weak signal.
     endmenu
 
     menu "Audio Output"
