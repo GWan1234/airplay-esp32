@@ -92,13 +92,13 @@ set( DEPS
     boards
     dac
     dac_tas58xx
+    dac_tas57xx
     display
     audio-resampler
     esp_eth
     spiffs_storage
 )
 
-# TODO: why these fall over in CI and fine locally...
 # Bluetooth component only needed when A2DP is enabled
 #if(CONFIG_BT_A2DP_ENABLE)
     list(APPEND DEPS bt)
