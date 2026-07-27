@@ -162,6 +162,8 @@ void audio_timing_reset(audio_timing_t *timing) {
   timing->quick_start = false;
   timing->deferred_flush_pending = false;
   timing->flush_until_ts = 0;
+  timing->late_drop_count = 0;
+  timing->late_drop_active = false;
 }
 
 void audio_timing_set_format(audio_timing_t *timing,
@@ -316,15 +318,18 @@ size_t audio_timing_read(audio_timing_t *timing, audio_buffer_t *buffer,
     sync_mode = SYNC_MODE_NTP;
   }
 
-  // Drain up to MAX_DRAIN_ATTEMPTS late/invalid frames within a SINGLE
-  // DMA callback.  The previous limit of 8 was the root cause of run-away
-  // lateness: each call that returned silence (instead of playing a frame)
-  // forfeited ~23 ms of RTP advancement while wall time kept moving, so
-  // every late frame we dropped MADE us more late.  Draining many frames
-  // in one pass advances RTP at zero wall-time cost and lets the buffer
-  // skip past stale data without the DMA ever idling.
-  enum { MAX_DRAIN_ATTEMPTS = 256 };
+  // Keep the playout task bounded.  Stale frames are still drained in batches,
+  // but a single call may spend at most ~1.5 ms here.  The RTP gate in the
+  // buffered receiver now prevents new old-track frames from being decoded, so
+  // this loop normally only clears a small residual PCM backlog.
+  enum { MAX_DRAIN_ATTEMPTS = 64 };
+  const int64_t drain_deadline_us = esp_timer_get_time() + 1500;
   for (int attempt = 0; attempt < MAX_DRAIN_ATTEMPTS; attempt++) {
+    // Check the deadline every eight iterations to limit esp_timer overhead.
+    if ((attempt & 7) == 0 && attempt != 0 &&
+        esp_timer_get_time() >= drain_deadline_us) {
+      break;
+    }
     size_t item_size = 0;
     void *item = NULL;
     bool from_pending = false;
@@ -491,11 +496,12 @@ size_t audio_timing_read(audio_timing_t *timing, audio_buffer_t *buffer,
           // Reset consecutive early counter on late/normal frames
           timing->consecutive_early_frames = 0;
 
-          // Late frame — drop it and continue draining within the SAME call.
-          // The 256-attempt drain loop chews through stale frames at zero
-          // wall-time cost, skipping past arbitrarily many stale frames in
-          // one pass without the DMA ever idling.
-          ESP_LOGW(TAG, "Dropping late frame: %lld ms", -early_us / 1000LL);
+          // Late frame: count it and continue within the bounded drain budget.
+          // Do not log per frame here; UART logging in the playout task is
+          // expensive and can itself cause further lateness.  A single summary
+          // is emitted when playout resumes.
+          timing->late_drop_count++;
+          timing->late_drop_active = true;
           if (stats) {
             stats->late_frames++;
           }
@@ -513,6 +519,10 @@ size_t audio_timing_read(audio_timing_t *timing, audio_buffer_t *buffer,
     // Frame is on time (or anchor-invalid) — reset counter.
     timing->consecutive_early_frames = 0;
 
+    // Snapshot metadata before the pool slot is returned below — reading
+    // hdr->rtp_timestamp after audio_buffer_return would be a use-after-return.
+    uint32_t played_rtp_timestamp = hdr->rtp_timestamp;
+
     // Copy PCM data to output
     memcpy(out, pcm, frame_samples * channels * sizeof(int16_t));
 
@@ -529,7 +539,14 @@ size_t audio_timing_read(audio_timing_t *timing, audio_buffer_t *buffer,
       bool was_quick = timing->quick_start;
       timing->quick_start = false;
       ESP_LOGI(TAG, "Playout started%s: rtp=%" PRIu32,
-               was_quick ? " (quick_start)" : "", hdr->rtp_timestamp);
+               was_quick ? " (quick_start)" : "", played_rtp_timestamp);
+    }
+
+    if (timing->late_drop_active) {
+      ESP_LOGW(TAG, "Late-frame drain complete: dropped=%" PRIu32,
+               timing->late_drop_count);
+      timing->late_drop_count = 0;
+      timing->late_drop_active = false;
     }
 
     return frame_samples;

@@ -107,7 +107,6 @@ static void playback_task(void *arg) {
     }
     size_t samples = audio_receiver_read(pcm, FRAME_SAMPLES + 1);
     if (samples > 0) {
-      ESP_LOGD(TAG, "Read %u samples from receiver", (unsigned int)samples);
       int16_t *play_buf = pcm;
       size_t play_samples = samples;
       if (audio_resample_is_active()) {
@@ -115,20 +114,20 @@ static void playback_task(void *arg) {
                                               MAX_RESAMPLE_FRAMES);
         play_buf = resample_buf;
       }
-      ESP_LOGD(TAG, "Resampled to %u samples", (unsigned int)play_samples);
       apply_volume(play_buf, play_samples * 2);
       apply_channel_mode(play_buf, play_samples);
       led_audio_feed(play_buf, play_samples);
-      i2s_channel_write(tx_handle, play_buf, play_samples * 4, &written,
-                        portMAX_DELAY);
-      ESP_LOGD(TAG, "I2S write: %u bytes written", (unsigned int)written);
+      i2s_channel_write(tx_handle, play_buf, play_samples * 2 * sizeof(int16_t),
+                        &written, portMAX_DELAY);
       taskYIELD();
     } else {
-      // ESP_LOGW(TAG, "Receiver underflow - playing silence");
+      // Receiver underflow — output a frame of silence.  Block on the DMA
+      // write (portMAX_DELAY) so the write itself paces the loop, instead of a
+      // short timeout plus vTaskDelay(1) which produced jittery silence.
       led_audio_feed(silence, FRAME_SAMPLES);
-      i2s_channel_write(tx_handle, silence, (size_t)FRAME_SAMPLES * 4, &written,
-                        pdMS_TO_TICKS(10));
-      vTaskDelay(1);
+      i2s_channel_write(tx_handle, silence,
+                        (size_t)FRAME_SAMPLES * 2 * sizeof(int16_t), &written,
+                        portMAX_DELAY);
     }
   }
 

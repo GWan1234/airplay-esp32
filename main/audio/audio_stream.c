@@ -26,14 +26,16 @@ static bool apply_aac_transient_mute(audio_receiver_state_t *state,
   return false;
 }
 
-bool audio_stream_process_frame(audio_receiver_state_t *state,
-                                uint32_t timestamp, const uint8_t *audio_data,
-                                size_t audio_len) {
-  if (!state || !state->decoder) {
+bool audio_stream_accept_timestamp(audio_receiver_state_t *state,
+                                   uint32_t timestamp) {
+  if (!state) {
     return false;
   }
 
   // Blanket gate: reject everything between seek_flush and the next anchor.
+  // Deliberately checked before decrypt/decode in the buffered TCP task so
+  // old-track backlog is drained from the socket without decoder CPU or PCM
+  // ring use.
   if (state->discard_all_until_anchor) {
     return false;
   }
@@ -56,6 +58,18 @@ bool audio_stream_process_frame(audio_receiver_state_t *state,
     }
     state->discard_above_rtp_valid = false;
   }
+
+  return true;
+}
+
+bool audio_stream_process_accepted_frame(audio_receiver_state_t *state,
+                                         uint32_t timestamp,
+                                         const uint8_t *audio_data,
+                                         size_t audio_len) {
+  if (!state || !state->decoder) {
+    return false;
+  }
+
   size_t capacity_samples = 0;
   int16_t *decode_buffer =
       audio_buffer_get_decode_buffer(&state->buffer, &capacity_samples);
@@ -80,9 +94,28 @@ bool audio_stream_process_frame(audio_receiver_state_t *state,
   apply_aac_transient_mute(state, decode_buffer, (size_t)decoded_samples,
                            channels);
 
+  // Re-check the blanket gate after decode.  A concurrent seek_flush (RTSP
+  // task) can set discard_all_until_anchor and flush the ring while this
+  // frame was being decrypted/decoded; without this second check the stale
+  // frame would land in the freshly flushed buffer.  This closes the
+  // gate→enqueue window that widens once gating moves ahead of decrypt.
+  if (state->discard_all_until_anchor) {
+    return false;
+  }
+
   return audio_buffer_queue_decoded(&state->buffer, &state->stats, timestamp,
                                     decode_buffer, (size_t)decoded_samples,
                                     channels);
+}
+
+bool audio_stream_process_frame(audio_receiver_state_t *state,
+                                uint32_t timestamp, const uint8_t *audio_data,
+                                size_t audio_len) {
+  if (!audio_stream_accept_timestamp(state, timestamp)) {
+    return false;
+  }
+  return audio_stream_process_accepted_frame(state, timestamp, audio_data,
+                                             audio_len);
 }
 
 audio_stream_t *audio_stream_create_realtime(void) {
