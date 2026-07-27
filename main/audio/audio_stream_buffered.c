@@ -219,6 +219,16 @@ static esp_err_t buffered_start(audio_stream_t *stream, uint16_t port) {
     return ESP_FAIL;
   }
 
+  // Worst-case memory snapshot: buffered streaming is the heaviest concurrent
+  // load (WiFi + lwip + decoder + PCM ring, plus BT controller resident on
+  // squeezeamp-bt).  Use this to size WiFi/TCP buffers without risking OOM.
+  ESP_LOGI(TAG,
+           "Buffered start: free heap %lu internal (largest block %lu), "
+           "%lu SPIRAM",
+           (unsigned long)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+           (unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+           (unsigned long)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+
   return ESP_OK;
 }
 

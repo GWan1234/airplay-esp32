@@ -24,6 +24,7 @@
 #endif
 
 #include "iot_board.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -286,6 +287,16 @@ void app_main(void) {
     }
   }
 #endif
+
+  // Boot baseline: free internal DRAM once WiFi (and BT, where enabled) are
+  // resident but before any stream is active.  Compare against the
+  // "Buffered start" log to see the headroom available for WiFi/TCP buffers.
+  ESP_LOGI(TAG,
+           "Boot baseline: free heap %lu internal (largest block %lu), "
+           "%lu SPIRAM",
+           (unsigned long)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+           (unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+           (unsigned long)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
 
   buttons_init();
 
