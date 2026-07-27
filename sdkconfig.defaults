@@ -41,6 +41,13 @@ CONFIG_LWIP_MAX_SOCKETS=16
 # sender is responsive when our PCM ring runs full.
 CONFIG_LWIP_SO_RCVBUF=y
 
+# Deepen the UDP receive mailbox.  The default of 6 overflows under the
+# bursty RTP delivery of AirPlay realtime (ALAC) unbuffered streams,
+# dropping datagrams before the audio task can drain them (~8% loss).
+# The mailbox holds pbuf pointers only (~4 bytes/slot), so this is cheap
+# and cuts realtime UDP loss to ~1-2%.
+CONFIG_LWIP_UDP_RECVMBOX_SIZE=64
+
 # Logging
 CONFIG_LOG_DEFAULT_LEVEL_INFO=y
 CONFIG_LOG_DEFAULT_LEVEL=3
