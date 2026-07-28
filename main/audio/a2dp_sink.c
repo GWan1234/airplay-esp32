@@ -743,6 +743,16 @@ static void bt_deinit_profiles(void) {
   esp_a2d_sink_deinit();
 }
 
+// Apply the saved connectable/discoverable preference.  Assumes bluedroid is
+// enabled and the profiles are registered.
+static void bt_apply_scan_mode(void) {
+  if (s_bt_discoverable) {
+    esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_GENERAL_DISCOVERABLE);
+  } else {
+    esp_bt_gap_set_scan_mode(ESP_BT_NON_CONNECTABLE, ESP_BT_NON_DISCOVERABLE);
+  }
+}
+
 static void bt_stack_evt_handler(uint16_t event, void *param) {
   (void)param;
 
@@ -891,13 +901,28 @@ esp_err_t bt_a2dp_sink_suspend(void) {
 
   esp_err_t err = esp_bluedroid_disable();
   if (err != ESP_OK) {
-    ESP_LOGE(TAG, "bluedroid disable failed: %s", esp_err_to_name(err));
+    // Bluedroid is still enabled; re-register the profiles we just tore down
+    // so BT stays functional rather than being left half-dismantled.
+    ESP_LOGE(TAG, "bluedroid disable failed: %s — restoring profiles",
+             esp_err_to_name(err));
+    bt_register_profiles();
+    bt_apply_scan_mode();
     return err;
   }
   err = esp_bt_controller_disable();
   if (err != ESP_OK) {
-    ESP_LOGE(TAG, "controller disable failed: %s", esp_err_to_name(err));
-    esp_bluedroid_enable(); // best-effort rollback
+    // Roll bluedroid back up and re-register the profiles so BT is restored to
+    // a working, non-suspended state instead of being bricked until reboot.
+    ESP_LOGE(TAG, "controller disable failed: %s — rolling back",
+             esp_err_to_name(err));
+    if (esp_bluedroid_enable() == ESP_OK) {
+      bt_register_profiles();
+      bt_apply_scan_mode();
+    } else {
+      ESP_LOGE(TAG,
+               "bluedroid re-enable failed during rollback — "
+               "BT unavailable until reboot");
+    }
     return err;
   }
 
@@ -927,11 +952,7 @@ esp_err_t bt_a2dp_sink_resume(void) {
   // Re-register the profiles torn down in suspend, then restore the
   // connectable/discoverable state saved before suspend.
   bt_register_profiles();
-  if (s_bt_discoverable) {
-    esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_GENERAL_DISCOVERABLE);
-  } else {
-    esp_bt_gap_set_scan_mode(ESP_BT_NON_CONNECTABLE, ESP_BT_NON_DISCOVERABLE);
-  }
+  bt_apply_scan_mode();
   return ESP_OK;
 }
 
