@@ -1293,9 +1293,22 @@ static void handle_setup(int socket, rtsp_conn_t *conn,
   } else {
     int64_t latency_min = 0;
     const char *latency_src = "default";
-    if (body && body_len > 0 &&
-        bplist_find_int(body, body_len, "latencyMin", &latency_min) &&
-        latency_min > 0 && latency_min <= 5 * 44100) {
+    // latencyMin is a per-stream key inside the SETUP streams[] dict, not a
+    // top-level key — read it the same way as ct/sr/spf above.
+    if (body && body_len > 0) {
+      bplist_kv_info_t kv[16];
+      size_t kv_count = 0;
+      if (bplist_get_stream_kv_info(body, body_len, 0, kv, 16, &kv_count)) {
+        for (size_t k = 0; k < kv_count; k++) {
+          if (kv[k].value_type == BPLIST_VALUE_INT &&
+              strcmp(kv[k].key, "latencyMin") == 0) {
+            latency_min = kv[k].int_value;
+            break;
+          }
+        }
+      }
+    }
+    if (latency_min > 0 && latency_min <= 5 * 44100) {
       latency_src = "SETUP latencyMin";
     } else {
       latency_min = AIRPLAY_RT_LATENCY_DEFAULT_SAMPLES;
