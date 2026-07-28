@@ -886,7 +886,7 @@ bool bt_a2dp_sink_is_suspended(void) {
   return s_bt_suspended;
 }
 
-esp_err_t bt_a2dp_sink_suspend(void) {
+static esp_err_t bt_suspend_locked(void) {
   if (s_bt_suspended) {
     return ESP_OK;
   }
@@ -947,7 +947,7 @@ esp_err_t bt_a2dp_sink_suspend(void) {
   return ESP_OK;
 }
 
-esp_err_t bt_a2dp_sink_resume(void) {
+static esp_err_t bt_resume_locked(void) {
   if (!s_bt_suspended) {
     return ESP_OK;
   }
@@ -973,6 +973,65 @@ esp_err_t bt_a2dp_sink_resume(void) {
   bt_apply_scan_mode();
   bt_restore_saved_volume();
   return ESP_OK;
+}
+
+// ---------------------------------------------------------------------------
+// Suspend/resume mutate the Bluedroid stack (profile deinit/init, controller
+// enable/disable).  They must not run directly on the caller's (coex) task
+// because bt_app_task keeps dispatching A2DP/AVRC handlers — tearing the stack
+// down or rebuilding it under an in-flight callback races them.  Instead run
+// the operation on bt_app_task itself (the same serialised queue that stack-up
+// uses) and block the caller until it finishes, returning its result.
+// ---------------------------------------------------------------------------
+typedef struct {
+  esp_err_t (*fn)(void);
+  esp_err_t result;
+  SemaphoreHandle_t done;
+} bt_sync_op_t;
+
+// Only ever one op is in flight: bt_run_on_app_task blocks until it completes,
+// and its sole caller (the coex task) issues them serially.
+static bt_sync_op_t *s_pending_op;
+
+static void bt_sync_op_runner(uint16_t event, void *param) {
+  (void)event;
+  (void)param;
+  bt_sync_op_t *op = s_pending_op;
+  op->result = op->fn();
+  xSemaphoreGive(op->done);
+}
+
+static esp_err_t bt_run_on_app_task(esp_err_t (*fn)(void)) {
+  if (!s_bt_task_queue) {
+    return ESP_ERR_INVALID_STATE;
+  }
+  // If somehow invoked from bt_app_task itself, run inline — dispatching to our
+  // own queue and then blocking on it would dead-lock.
+  if (xTaskGetCurrentTaskHandle() == s_bt_task_handle) {
+    return fn();
+  }
+
+  bt_sync_op_t op = {.fn = fn, .result = ESP_FAIL, .done = NULL};
+  op.done = xSemaphoreCreateBinary();
+  if (!op.done) {
+    return ESP_ERR_NO_MEM;
+  }
+  s_pending_op = &op;
+  if (!bt_app_work_dispatch(bt_sync_op_runner, 0, NULL, 0)) {
+    vSemaphoreDelete(op.done);
+    return ESP_FAIL;
+  }
+  xSemaphoreTake(op.done, portMAX_DELAY);
+  vSemaphoreDelete(op.done);
+  return op.result;
+}
+
+esp_err_t bt_a2dp_sink_suspend(void) {
+  return bt_run_on_app_task(bt_suspend_locked);
+}
+
+esp_err_t bt_a2dp_sink_resume(void) {
+  return bt_run_on_app_task(bt_resume_locked);
 }
 
 // ============================================================================
