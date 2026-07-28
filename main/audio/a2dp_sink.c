@@ -38,6 +38,7 @@
 #include "freertos/task.h"
 
 #include <inttypes.h>
+#include <stdio.h>
 #include <string.h>
 
 static const char *TAG = "bt_a2dp";
@@ -98,6 +99,11 @@ static volatile bool s_audio_started = false;
 static volatile bool s_avrc_playing = false; /* AVRCP play state (instant) */
 static volatile bool s_i2s_task_running = false;
 static bool s_bt_discoverable = true;
+// Radio suspended (controller+bluedroid disabled) to free WiFi airtime while
+// AirPlay is streaming.  Reversible without a reboot: memory is retained.
+static bool s_bt_suspended = false;
+// Advertised BT device name, saved so it can be re-applied after a resume.
+static char s_device_name[64] = {0};
 static uint8_t s_avrc_volume = 64; /* 0-127, AVRCP absolute volume */
 static volatile bool s_vol_ntf_pending =
     false; /* phone registered for volume change */
@@ -678,17 +684,18 @@ static void bt_gap_cb(esp_bt_gap_cb_event_t event,
 /* Stack-up handler — called when Bluedroid is (re-)enabled                   */
 /* ========================================================================== */
 
-static void bt_stack_evt_handler(uint16_t event, void *param) {
-  (void)param;
-
-  if (event != BT_APP_EVT_STACK_UP) {
-    return;
-  }
-
-  ESP_LOGI(TAG, "BT stack up, initializing profiles");
-
+// Register the GAP/AVRC/A2DP profiles.  Shared by the initial stack-up path
+// and bt_a2dp_sink_resume(), so a suspend/resume cycle re-registers the L2CAP
+// PSMs cleanly instead of relying on them surviving esp_bluedroid_disable().
+static void bt_register_profiles(void) {
   // GAP
   esp_bt_gap_register_callback(bt_gap_cb);
+
+  // (Re-)apply the advertised device name.  Required after a resume because
+  // the name does not survive esp_bluedroid_disable().
+  if (s_device_name[0] != '\0') {
+    esp_bt_gap_set_device_name(s_device_name);
+  }
 
 #ifdef CONFIG_BT_SSP_ENABLED
   // Secure Simple Pairing — numeric comparison for BT 2.1+ devices
@@ -724,6 +731,28 @@ static void bt_stack_evt_handler(uint16_t event, void *param) {
   esp_a2d_register_callback(bt_a2dp_cb);
   esp_a2d_sink_register_data_callback(bt_a2dp_data_cb);
   esp_a2d_sink_init();
+}
+
+// Deregister the profiles before suspending so their L2CAP PSMs (0x0019 AVDTP,
+// 0x0017 AVCTP) are torn down cleanly rather than during bluedroid disable.
+// Order matters: Bluedroid requires AVRC (TG then CT) to be deinited *before*
+// A2DP, otherwise it logs "AVRC should deinit in advance of A2DP".
+static void bt_deinit_profiles(void) {
+  esp_avrc_tg_deinit();
+  esp_avrc_ct_deinit();
+  esp_a2d_sink_deinit();
+}
+
+static void bt_stack_evt_handler(uint16_t event, void *param) {
+  (void)param;
+
+  if (event != BT_APP_EVT_STACK_UP) {
+    return;
+  }
+
+  ESP_LOGI(TAG, "BT stack up, initializing profiles");
+
+  bt_register_profiles();
 
   // Apply saved discoverable state
   if (s_bt_discoverable) {
@@ -791,7 +820,9 @@ esp_err_t bt_a2dp_sink_init(const char *device_name,
     return err;
   }
 
-  // Set device name
+  // Save the device name so it can be re-applied after a suspend/resume; the
+  // stack-up profile registration (bt_register_profiles) applies it.
+  snprintf(s_device_name, sizeof(s_device_name), "%s", device_name);
   esp_bt_gap_set_device_name(device_name);
 
   // Create the BT app task and event queue
@@ -821,7 +852,9 @@ bool bt_a2dp_sink_is_connected(void) {
 
 void bt_a2dp_sink_set_discoverable(bool discoverable) {
   s_bt_discoverable = discoverable;
-  if (s_connected) {
+  if (s_connected || s_bt_suspended) {
+    // Suspended: only the saved preference is updated; the scan mode is
+    // re-applied by bt_a2dp_sink_resume().
     return;
   }
   if (discoverable) {
@@ -831,6 +864,75 @@ void bt_a2dp_sink_set_discoverable(bool discoverable) {
     ESP_LOGI(TAG, "BT discoverable disabled");
     esp_bt_gap_set_scan_mode(ESP_BT_NON_CONNECTABLE, ESP_BT_NON_DISCOVERABLE);
   }
+}
+
+bool bt_a2dp_sink_is_suspended(void) {
+  return s_bt_suspended;
+}
+
+esp_err_t bt_a2dp_sink_suspend(void) {
+  if (s_bt_suspended) {
+    return ESP_OK;
+  }
+  if (s_connected) {
+    // A phone is actively streaming over BT — don't pull the radio out from
+    // under it.  (Shouldn't happen while AirPlay is the active source.)
+    ESP_LOGW(TAG, "Not suspending BT: A2DP device connected");
+    return ESP_ERR_INVALID_STATE;
+  }
+
+  ESP_LOGI(TAG, "Suspending Bluetooth radio (freeing airtime for WiFi)");
+  // Stop accepting connections before tearing the radio down.
+  esp_bt_gap_set_scan_mode(ESP_BT_NON_CONNECTABLE, ESP_BT_NON_DISCOVERABLE);
+
+  // Deregister profiles first so their L2CAP PSMs are removed cleanly (avoids
+  // the "PSM not found for deregistration" warnings during bluedroid disable).
+  bt_deinit_profiles();
+
+  esp_err_t err = esp_bluedroid_disable();
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG, "bluedroid disable failed: %s", esp_err_to_name(err));
+    return err;
+  }
+  err = esp_bt_controller_disable();
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG, "controller disable failed: %s", esp_err_to_name(err));
+    esp_bluedroid_enable(); // best-effort rollback
+    return err;
+  }
+
+  s_bt_suspended = true;
+  return ESP_OK;
+}
+
+esp_err_t bt_a2dp_sink_resume(void) {
+  if (!s_bt_suspended) {
+    return ESP_OK;
+  }
+
+  ESP_LOGI(TAG, "Resuming Bluetooth radio");
+  esp_err_t err = esp_bt_controller_enable(ESP_BT_MODE_CLASSIC_BT);
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG, "controller enable failed: %s", esp_err_to_name(err));
+    return err;
+  }
+  err = esp_bluedroid_enable();
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG, "bluedroid enable failed: %s", esp_err_to_name(err));
+    esp_bt_controller_disable(); // roll back to a consistent suspended state
+    return err;
+  }
+
+  s_bt_suspended = false;
+  // Re-register the profiles torn down in suspend, then restore the
+  // connectable/discoverable state saved before suspend.
+  bt_register_profiles();
+  if (s_bt_discoverable) {
+    esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_GENERAL_DISCOVERABLE);
+  } else {
+    esp_bt_gap_set_scan_mode(ESP_BT_NON_CONNECTABLE, ESP_BT_NON_DISCOVERABLE);
+  }
+  return ESP_OK;
 }
 
 // ============================================================================
