@@ -146,6 +146,13 @@ void audio_receiver_set_deferred_flush(uint32_t flush_until_ts);
 void audio_receiver_pause(void);
 
 /**
+ * Set the stream playout latency in samples, added to every frame's
+ * anchor-scheduled play time.  Realtime streams (type 96): latencyMin from
+ * SETUP (default 11025 = 250 ms).  Buffered streams (type 103): 0.
+ */
+void audio_receiver_set_playout_latency_samples(uint32_t latency_samples);
+
+/**
  * Set advertised/target output latency in microseconds.
  */
 void audio_receiver_set_output_latency_us(uint32_t latency_us);
@@ -161,10 +168,13 @@ uint32_t audio_receiver_get_output_latency_us(void);
 uint32_t audio_receiver_get_hardware_latency_us(void);
 
 /**
- * Get total advertised latency in microseconds.  Includes the jitter-buffer
- * target depth, hardware DMA delay, and fixed decrypt/decode/network
- * pipeline constant.  Report this in outputLatencyMicros so the phone
- * schedules sends to match our actual end-to-end depth.
+ * Get total latency in microseconds (jitter-buffer target depth + hardware
+ * DMA delay + fixed pipeline constant).
+ *
+ * DIAGNOSTIC ONLY — do NOT report this in outputLatencyMicros.  The RTSP
+ * layer intentionally advertises 0; see audio_timing_get_advertised_latency()
+ * in audio_timing.h for why advertising a non-zero value double-compensates
+ * and makes this device play ahead of other speakers.
  */
 uint32_t audio_receiver_get_advertised_latency_us(void);
 
