@@ -49,6 +49,10 @@ static bool s_airplay_infrastructure_ready = false;
 #define BT_RESUME_IDLE_US (15 * 1000000LL)
 static volatile bool s_bt_suspend_requested = false;
 static volatile bool s_bt_resume_requested = false;
+// Set when an AirPlay client (re)connects to cancel any pending resume armed by
+// a previous disconnect, so a quick reconnect keeps BT suspended instead of
+// briefly resuming it during session setup.
+static volatile bool s_bt_cancel_resume = false;
 #endif
 
 static void start_airplay_services(void) {
@@ -126,6 +130,12 @@ static void network_monitor_task(void *pvParameters) {
     // resume brings BT back after the post-playback idle delay.  Each request
     // flag / deadline is cleared only once the operation succeeds, so a
     // transient failure is retried on the next loop rather than being lost.
+    if (s_bt_cancel_resume) {
+      // A client (re)connected: drop any pending resume so BT stays suspended.
+      s_bt_cancel_resume = false;
+      s_bt_resume_requested = false;
+      bt_resume_deadline_us = 0;
+    }
     if (s_bt_suspend_requested) {
       if (bt_a2dp_sink_suspend() == ESP_OK) {
         s_bt_suspend_requested = false;
@@ -217,6 +227,9 @@ static void on_airplay_client_event(rtsp_event_t event,
   case RTSP_EVENT_CLIENT_CONNECTED:
     ESP_LOGI(TAG, "AirPlay client connected — disabling BT");
     bt_a2dp_sink_set_discoverable(false);
+    // Cancel any resume armed by a previous disconnect so a quick reconnect
+    // keeps BT suspended (PLAYING will re-request suspend shortly).
+    s_bt_cancel_resume = true;
     break;
   case RTSP_EVENT_PLAYING:
     // Audio is actively streaming — free the radio for WiFi by suspending BT.

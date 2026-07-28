@@ -62,6 +62,29 @@ bool audio_stream_accept_timestamp(audio_receiver_state_t *state,
   return true;
 }
 
+// Read-only variant of the RTP gate used for the post-decode re-check.  Unlike
+// audio_stream_accept_timestamp() it does NOT disarm the window gates on a
+// passing frame — disarming is the job of the ordered pre-decode pass.  If a
+// concurrent seek armed a window gate while this frame was mid-decode and the
+// frame happens to fall inside the new window, disarming here would clear the
+// gate and let subsequent stale TCP backlog through.  This check only reports
+// whether the frame must be dropped.
+static bool timestamp_is_gated(const audio_receiver_state_t *state,
+                               uint32_t timestamp) {
+  if (state->discard_all_until_anchor) {
+    return true;
+  }
+  if (state->discard_before_rtp_valid &&
+      (int32_t)(timestamp - state->discard_before_rtp) < 0) {
+    return true;
+  }
+  if (state->discard_above_rtp_valid &&
+      (int32_t)(timestamp - state->discard_above_rtp) > 0) {
+    return true;
+  }
+  return false;
+}
+
 bool audio_stream_process_accepted_frame(audio_receiver_state_t *state,
                                          uint32_t timestamp,
                                          const uint8_t *audio_data,
@@ -94,13 +117,13 @@ bool audio_stream_process_accepted_frame(audio_receiver_state_t *state,
   apply_aac_transient_mute(state, decode_buffer, (size_t)decoded_samples,
                            channels);
 
-  // Re-check ALL gates after decode.  A concurrent seek/anchor flush (RTSP
-  // task) can either set discard_all_until_anchor OR arm the RTP window gates
+  // Re-check the gates after decode.  A concurrent seek/anchor flush (RTSP
+  // task) can set discard_all_until_anchor OR arm the RTP window gates
   // (discard_before_rtp / discard_above_rtp, Path B) and flush the ring while
-  // this frame was being decrypted/decoded.  Re-running the full timestamp gate
-  // — not just the blanket flag — prevents a stale mid-flight frame from
-  // landing in the freshly flushed buffer.
-  if (!audio_stream_accept_timestamp(state, timestamp)) {
+  // this frame was being decrypted/decoded.  Use the read-only predicate so a
+  // stale mid-flight frame is dropped without disarming a gate a concurrent
+  // seek just armed (which would let later backlog through).
+  if (timestamp_is_gated(state, timestamp)) {
     return false;
   }
 
