@@ -905,6 +905,18 @@ esp_err_t bt_a2dp_sink_suspend(void) {
   // the "PSM not found for deregistration" warnings during bluedroid disable).
   bt_deinit_profiles();
 
+  // Re-check after tearing down the A2DP/AVRC profiles: a device may have
+  // completed its connection during the scan-mode/deinit window (between the
+  // initial s_connected check and here).  Now that the profiles are gone no
+  // new connection can complete, so if one did, abort the suspend and restore
+  // the profiles rather than disabling the radio out from under a live link.
+  if (s_connected) {
+    ESP_LOGW(TAG, "BT connected mid-suspend — aborting, restoring profiles");
+    bt_register_profiles();
+    bt_apply_scan_mode();
+    return ESP_ERR_INVALID_STATE;
+  }
+
   esp_err_t err = esp_bluedroid_disable();
   if (err != ESP_OK) {
     // Bluedroid is still enabled; re-register the profiles we just tore down

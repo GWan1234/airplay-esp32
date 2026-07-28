@@ -100,9 +100,15 @@ static coex_state_t coex_on_event(coex_state_t state, bt_coex_event_t evt,
 
   case BT_COEX_EVT_BT_CONNECTED:
   case BT_COEX_EVT_BT_DISCONNECTED:
-    // Bluetooth owns the radio: AirPlay is stopped while a BT device is
-    // connected and restarts when it disconnects.  Either way the radio is
-    // active with no pending coexistence action.
+    // Bluetooth owns the radio and needs it up.  Normally the radio is already
+    // active here.  But if a suspend raced with the connection (suspend passed
+    // its s_connected check, then the connection completed before the disable),
+    // the radio can actually be suspended while our tracked state says
+    // otherwise — reconcile with the hardware by resuming, so the state never
+    // desyncs and leaves Bluetooth off until reboot.
+    if (bt_a2dp_sink_is_suspended()) {
+      return coex_do_resume(wake_at);
+    }
     return COEX_ACTIVE;
   }
   return state;
