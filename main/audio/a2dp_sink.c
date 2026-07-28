@@ -919,9 +919,8 @@ esp_err_t bt_a2dp_sink_suspend(void) {
       bt_register_profiles();
       bt_apply_scan_mode();
     } else {
-      ESP_LOGE(TAG,
-               "bluedroid re-enable failed during rollback — "
-               "BT unavailable until reboot");
+      ESP_LOGE(TAG, "bluedroid re-enable failed during rollback — "
+                    "BT unavailable until reboot");
     }
     return err;
   }
