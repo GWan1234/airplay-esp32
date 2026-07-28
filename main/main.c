@@ -131,9 +131,12 @@ static void network_monitor_task(void *pvParameters) {
     // flag / deadline is cleared only once the operation succeeds, so a
     // transient failure is retried on the next loop rather than being lost.
     if (s_bt_cancel_resume) {
-      // A client (re)connected: drop any pending resume so BT stays suspended.
+      // A client (re)connected: cancel a resume deadline armed in an EARLIER
+      // poll window so BT stays suspended.  Do NOT clear s_bt_resume_requested
+      // here — a DISCONNECTED that fired after the connect (same window)
+      // supersedes this cancel and clears s_bt_cancel_resume itself, so the
+      // newer resume request survives (last-writer-wins on the paired flags).
       s_bt_cancel_resume = false;
-      s_bt_resume_requested = false;
       bt_resume_deadline_us = 0;
     }
     if (s_bt_suspend_requested) {
@@ -237,8 +240,11 @@ static void on_airplay_client_event(rtsp_event_t event,
   case RTSP_EVENT_CLIENT_CONNECTED:
     ESP_LOGI(TAG, "AirPlay client connected — disabling BT");
     bt_a2dp_sink_set_discoverable(false);
-    // Cancel any resume armed by a previous disconnect so a quick reconnect
-    // keeps BT suspended (PLAYING will re-request suspend shortly).
+    // Cancel any resume queued/armed by a previous disconnect so a quick
+    // reconnect keeps BT suspended (PLAYING will re-request suspend shortly).
+    // Paired with DISCONNECTED as last-writer-wins: each clears the other's
+    // flag, so a disconnect after this connect still resumes BT.
+    s_bt_resume_requested = false;
     s_bt_cancel_resume = true;
     break;
   case RTSP_EVENT_PLAYING:
@@ -257,6 +263,9 @@ static void on_airplay_client_event(rtsp_event_t event,
   case RTSP_EVENT_DISCONNECTED:
     ESP_LOGI(TAG, "AirPlay client disconnected — BT resumes after idle delay");
     bt_a2dp_sink_set_discoverable(true);
+    // Supersede a cancel queued by an earlier connect in the same poll window
+    // so this (newer) resume request wins.
+    s_bt_cancel_resume = false;
     s_bt_resume_requested = true;
     break;
   default:
