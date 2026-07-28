@@ -54,10 +54,17 @@ CONFIG_FREERTOS_TIMER_QUEUE_LENGTH=16
 # already consumes ~100 KB of the ~320 KB budget.
 CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=1024
 
-# Smaller TCP windows — BT/WiFi coexistence halves radio bandwidth,
-# so the default 4×MSS buffers waste memory.  2×MSS is sufficient.
+# TCP receive window for data flowing TO the device (uploads, OTA, buffered
+# AAC). SND_BUF stays small — device→peer bulk sends are rare and irrelevant here.
+# NOTE: while the BT controller is active, WiFi/BT coexistence pins the
+# effective RTT (~200 ms, delayed-ACK under bursty coex RX), so this window has
+# little effect (measured ~0.6 Mbit/s regardless of size).  It only pays off
+# once BT is suspended during AirPlay (see bt_a2dp_sink_suspend), when the radio
+# is clear and receive throughput jumps (~4 Mbit/s).  TCP buffers allocate as
+# small pbuf chains on demand, so this costs aggregate internal heap (worst case
+# ~55 KB free), not the largest-free-block.
 CONFIG_LWIP_TCP_SND_BUF_DEFAULT=2880
-CONFIG_LWIP_TCP_WND_DEFAULT=2880
+CONFIG_LWIP_TCP_WND_DEFAULT=15840
 
 # Reduce IRAM usage: WiFi ISR optimisations moved to flash (saves ~12 KB)
 CONFIG_ESP_WIFI_IRAM_OPT=n
