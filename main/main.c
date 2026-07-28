@@ -137,9 +137,15 @@ static void network_monitor_task(void *pvParameters) {
       bt_resume_deadline_us = 0;
     }
     if (s_bt_suspend_requested) {
-      if (bt_a2dp_sink_suspend() == ESP_OK) {
+      // ESP_OK = suspended (or already suspended).  ESP_ERR_INVALID_STATE =
+      // a BT device is connected, so suspend is not applicable — clear the
+      // request in both cases.  Any other error is transient: retry next loop.
+      esp_err_t serr = bt_a2dp_sink_suspend();
+      if (serr == ESP_OK || serr == ESP_ERR_INVALID_STATE) {
         s_bt_suspend_requested = false;
-        bt_resume_deadline_us = 0; // a new stream cancels any pending resume
+        if (serr == ESP_OK) {
+          bt_resume_deadline_us = 0; // a new stream cancels any pending resume
+        }
       }
     }
     if (s_bt_resume_requested) {
@@ -205,6 +211,10 @@ static void on_bt_state_changed(bool connected) {
   if (connected) {
     ESP_LOGI(TAG, "BT connected — disabling AirPlay");
     stop_airplay_services();
+    // BT is now the active source: drop any pending AirPlay-driven suspend
+    // request so it doesn't fire the moment BT later disconnects (which would
+    // block a BT reconnect until the idle-resume timer runs).
+    s_bt_suspend_requested = false;
     playback_control_set_source(PLAYBACK_SOURCE_BLUETOOTH);
   } else {
     ESP_LOGI(TAG, "BT disconnected — re-enabling AirPlay");
