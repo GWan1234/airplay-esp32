@@ -753,6 +753,21 @@ static void bt_apply_scan_mode(void) {
   }
 }
 
+// Push the saved BT volume to the DAC (falls back to 64 / -15 dB if none
+// stored).  Applied on stack-up and on resume, so the first A2DP playback
+// after a suspend/resume cycle starts at the correct level instead of whatever
+// AirPlay last set, without waiting for an AVRCP volume update.
+static void bt_restore_saved_volume(void) {
+  uint8_t saved_vol;
+  if (settings_get_bt_volume(&saved_vol) == ESP_OK) {
+    s_avrc_volume = saved_vol;
+  }
+  float volume_db = ((float)s_avrc_volume / 127.0f) * 30.0f - 30.0f;
+  dac_set_volume(volume_db);
+  ESP_LOGI(TAG, "BT volume restored: %d/127 (%.1f dB)", s_avrc_volume,
+           volume_db);
+}
+
 static void bt_stack_evt_handler(uint16_t event, void *param) {
   (void)param;
 
@@ -772,16 +787,7 @@ static void bt_stack_evt_handler(uint16_t event, void *param) {
   }
 
   // Restore saved BT volume (falls back to 64 / -15 dB if none stored)
-  {
-    uint8_t saved_vol;
-    if (settings_get_bt_volume(&saved_vol) == ESP_OK) {
-      s_avrc_volume = saved_vol;
-    }
-    float volume_db = ((float)s_avrc_volume / 127.0f) * 30.0f - 30.0f;
-    dac_set_volume(volume_db);
-    ESP_LOGI(TAG, "BT volume restored: %d/127 (%.1f dB)", s_avrc_volume,
-             volume_db);
-  }
+  bt_restore_saved_volume();
 
   ESP_LOGI(TAG, "BT A2DP sink ready, waiting for connections");
 }
@@ -948,10 +954,12 @@ esp_err_t bt_a2dp_sink_resume(void) {
   }
 
   s_bt_suspended = false;
-  // Re-register the profiles torn down in suspend, then restore the
-  // connectable/discoverable state saved before suspend.
+  // Re-register the profiles torn down in suspend, restore the connectable/
+  // discoverable state, and re-apply the saved BT volume to the DAC (AirPlay
+  // may have changed it) so post-resume A2DP starts at the right level.
   bt_register_profiles();
   bt_apply_scan_mode();
+  bt_restore_saved_volume();
   return ESP_OK;
 }
 

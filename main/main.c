@@ -123,11 +123,14 @@ static void network_monitor_task(void *pvParameters) {
     // Act on BT suspend/resume requests here — a normal task context, since
     // esp_bt_controller_*/esp_bluedroid_* must not run in the RTSP callback or
     // esp_timer context.  Suspend frees the radio for WiFi during AirPlay;
-    // resume brings BT back after the post-playback idle delay.
+    // resume brings BT back after the post-playback idle delay.  Each request
+    // flag / deadline is cleared only once the operation succeeds, so a
+    // transient failure is retried on the next loop rather than being lost.
     if (s_bt_suspend_requested) {
-      s_bt_suspend_requested = false;
-      bt_resume_deadline_us = 0; // a new stream cancels any pending resume
-      bt_a2dp_sink_suspend();
+      if (bt_a2dp_sink_suspend() == ESP_OK) {
+        s_bt_suspend_requested = false;
+        bt_resume_deadline_us = 0; // a new stream cancels any pending resume
+      }
     }
     if (s_bt_resume_requested) {
       s_bt_resume_requested = false;
@@ -135,8 +138,10 @@ static void network_monitor_task(void *pvParameters) {
     }
     if (bt_resume_deadline_us != 0 &&
         esp_timer_get_time() >= bt_resume_deadline_us) {
-      bt_resume_deadline_us = 0;
-      bt_a2dp_sink_resume();
+      if (bt_a2dp_sink_resume() == ESP_OK) {
+        bt_resume_deadline_us = 0;
+      }
+      // On failure leave the deadline expired so the next loop retries.
     }
 #endif
 
