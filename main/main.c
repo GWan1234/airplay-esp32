@@ -41,12 +41,14 @@ static bool s_airplay_infrastructure_ready = false;
 #ifdef CONFIG_BT_A2DP_ENABLE
 // WiFi/BT coexistence: the BT controller throttles WiFi RX even when idle, so
 // the radio is suspended while AirPlay is actively streaming and resumed after
-// a period with no AirPlay activity.  Flags are set from the RTSP event
-// callback and acted on in network_monitor_task (a safe task context — BT
-// enable/disable must not run in the esp_timer/callback context).
+// a period with no AirPlay activity.  These bool request flags are set from the
+// RTSP event callback and acted on in network_monitor_task (a safe task context
+// — BT enable/disable must not run in the esp_timer/callback context).  The
+// resume countdown deadline lives task-locally in network_monitor_task, so no
+// 64-bit value is shared across cores (avoids torn reads on dual-core ESP32).
 #define BT_RESUME_IDLE_US (15 * 1000000LL)
 static volatile bool s_bt_suspend_requested = false;
-static volatile int64_t s_bt_resume_deadline_us = 0; // 0 = no resume pending
+static volatile bool s_bt_resume_requested = false;
 #endif
 
 static void start_airplay_services(void) {
@@ -103,6 +105,11 @@ static void network_monitor_task(void *pvParameters) {
   bool dns_running = !had_network;
   bool wifi_started = wifi_is_connected() || !ethernet_is_connected();
   bool had_eth = ethernet_is_connected();
+#ifdef CONFIG_BT_A2DP_ENABLE
+  // Task-local BT resume deadline (0 = none).  Only this task touches it, so
+  // there is no cross-core 64-bit sharing to tear.
+  int64_t bt_resume_deadline_us = 0;
+#endif
 
   // Start captive portal DNS if no network yet
   if (dns_running) {
@@ -119,10 +126,16 @@ static void network_monitor_task(void *pvParameters) {
     // resume brings BT back after the post-playback idle delay.
     if (s_bt_suspend_requested) {
       s_bt_suspend_requested = false;
+      bt_resume_deadline_us = 0; // a new stream cancels any pending resume
       bt_a2dp_sink_suspend();
-    } else if (s_bt_resume_deadline_us != 0 &&
-               esp_timer_get_time() >= s_bt_resume_deadline_us) {
-      s_bt_resume_deadline_us = 0;
+    }
+    if (s_bt_resume_requested) {
+      s_bt_resume_requested = false;
+      bt_resume_deadline_us = esp_timer_get_time() + BT_RESUME_IDLE_US;
+    }
+    if (bt_resume_deadline_us != 0 &&
+        esp_timer_get_time() >= bt_resume_deadline_us) {
+      bt_resume_deadline_us = 0;
       bt_a2dp_sink_resume();
     }
 #endif
@@ -203,20 +216,20 @@ static void on_airplay_client_event(rtsp_event_t event,
   case RTSP_EVENT_PLAYING:
     // Audio is actively streaming — free the radio for WiFi by suspending BT.
     // Cancel any pending resume so a brief pause→play does not flap the radio.
-    s_bt_resume_deadline_us = 0;
+    s_bt_resume_requested = false;
     s_bt_suspend_requested = true;
     break;
   case RTSP_EVENT_PAUSED:
-    // V1 grace period active — keep BT hidden so the phone reconnects
-    // to AirPlay rather than falling back to BT.  Arm the idle timer so BT
-    // resumes if the pause turns into a prolonged stop.
-    ESP_LOGI(TAG, "AirPlay paused — keeping BT hidden");
-    s_bt_resume_deadline_us = esp_timer_get_time() + BT_RESUME_IDLE_US;
+    // Keep BT suspended AND hidden during a pause: the AirPlay session is still
+    // active, so resuming BT here would only reintroduce coexistence throttling
+    // without making BT usable (it stays non-discoverable).  BT resumes only
+    // when the session actually ends (RTSP_EVENT_DISCONNECTED).
+    ESP_LOGI(TAG, "AirPlay paused — keeping BT suspended and hidden");
     break;
   case RTSP_EVENT_DISCONNECTED:
     ESP_LOGI(TAG, "AirPlay client disconnected — BT resumes after idle delay");
     bt_a2dp_sink_set_discoverable(true);
-    s_bt_resume_deadline_us = esp_timer_get_time() + BT_RESUME_IDLE_US;
+    s_bt_resume_requested = true;
     break;
   default:
     break;

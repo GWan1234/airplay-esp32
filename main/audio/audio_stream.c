@@ -94,12 +94,13 @@ bool audio_stream_process_accepted_frame(audio_receiver_state_t *state,
   apply_aac_transient_mute(state, decode_buffer, (size_t)decoded_samples,
                            channels);
 
-  // Re-check the blanket gate after decode.  A concurrent seek_flush (RTSP
-  // task) can set discard_all_until_anchor and flush the ring while this
-  // frame was being decrypted/decoded; without this second check the stale
-  // frame would land in the freshly flushed buffer.  This closes the
-  // gate→enqueue window that widens once gating moves ahead of decrypt.
-  if (state->discard_all_until_anchor) {
+  // Re-check ALL gates after decode.  A concurrent seek/anchor flush (RTSP
+  // task) can either set discard_all_until_anchor OR arm the RTP window gates
+  // (discard_before_rtp / discard_above_rtp, Path B) and flush the ring while
+  // this frame was being decrypted/decoded.  Re-running the full timestamp gate
+  // — not just the blanket flag — prevents a stale mid-flight frame from
+  // landing in the freshly flushed buffer.
+  if (!audio_stream_accept_timestamp(state, timestamp)) {
     return false;
   }
 
