@@ -239,6 +239,16 @@ void audio_timing_init(audio_timing_t *timing, size_t pending_capacity) {
   }
 }
 
+void audio_timing_reset_continuity(audio_timing_t *timing) {
+  if (!timing) {
+    return;
+  }
+  timing->expected_rtp_valid = false;
+  timing->pos_err_filtered_us = 0;
+  timing->servo_engaged = false;
+  timing->servo_phase = 0;
+}
+
 void audio_timing_reset(audio_timing_t *timing) {
   if (!timing) {
     return;
@@ -255,11 +265,8 @@ void audio_timing_reset(audio_timing_t *timing) {
   timing->flush_until_ts = 0;
   timing->late_drop_count = 0;
   timing->late_drop_active = false;
-  timing->pos_err_filtered_us = 0;
-  timing->servo_engaged = false;
-  timing->servo_phase = 0;
   timing->servo_trims = 0;
-  timing->expected_rtp_valid = false;
+  audio_timing_reset_continuity(timing);
 }
 
 void audio_timing_set_format(audio_timing_t *timing,
@@ -523,7 +530,7 @@ size_t audio_timing_read(audio_timing_t *timing, audio_buffer_t *buffer,
         }
         audio_buffer_flush(buffer);
         timing->deferred_flush_pending = false;
-        timing->expected_rtp_valid = false;
+        audio_timing_reset_continuity(timing);
         timing->playout_started = false;
         timing->ready_time_us = 0;
         timing->consecutive_early_frames = 0;

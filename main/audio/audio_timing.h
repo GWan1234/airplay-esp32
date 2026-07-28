@@ -85,6 +85,10 @@ typedef struct {
 
 void audio_timing_init(audio_timing_t *timing, size_t pending_capacity);
 void audio_timing_reset(audio_timing_t *timing);
+// Clear playback-derived continuity + servo filter state. Must run on every
+// re-lock (flush/seek/track-change), else a stale expected_rtp or servo bias
+// survives into the new segment.
+void audio_timing_reset_continuity(audio_timing_t *timing);
 void audio_timing_set_format(audio_timing_t *timing,
                              const audio_format_t *format);
 void audio_timing_set_output_latency(audio_timing_t *timing,

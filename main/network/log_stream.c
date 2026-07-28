@@ -102,20 +102,32 @@ static int log_vprintf_hook(const char *fmt, va_list args) {
 /* ------------------------------------------------------------------ */
 
 static esp_err_t ws_log_handler(httpd_req_t *req) {
-  /* On ESP-IDF >= 5.x the server completes the WebSocket handshake
-   * internally and does NOT invoke this handler for the handshake GET
-   * (httpd_uri.c: "If the request is websocket handshake, then do not
-   * call the uri->handler").  Clients are therefore not tracked here at
-   * all — the broadcast task discovers active WebSocket sessions each
-   * tick via httpd_get_client_list()/httpd_ws_get_fd_info().  An earlier
-   * version registered clients from a handshake-time HTTP_GET call that
-   * never happens on this IDF, so the viewer connected successfully but
-   * never received a single frame.
-   *
-   * This handler now only runs for incoming data frames, which a log
-   * viewer does not send; drain and ignore them. */
-  httpd_ws_frame_t frame = {.type = HTTPD_WS_TYPE_TEXT};
-  return httpd_ws_recv_frame(req, &frame, 0);
+  /* The server completes the WebSocket handshake internally; depending on the
+   * IDF build the handshake GET may or may not reach here.  Return OK for it
+   * and do nothing — clients are tracked by the broadcast task, not here. */
+  if (req->method == HTTP_GET) {
+    return ESP_OK;
+  }
+
+  /* A log viewer only receives, but browsers still send frames here (notably
+   * CLOSE on tab close/reconnect).  Probe the length, then CONSUME the
+   * payload: reading only the header (max_len 0) leaves the 4-byte mask key
+   * and payload in the socket, so the next frame is parsed mid-stream and
+   * misreported as "not properly masked", failing the handler.  Fully
+   * draining each frame keeps the framing aligned; ignore recv errors instead
+   * of returning them (which httpd logs as "uri handler execution failed"). */
+  httpd_ws_frame_t frame = {0};
+  if (httpd_ws_recv_frame(req, &frame, 0) != ESP_OK) {
+    return ESP_OK;
+  }
+  if (frame.len > 0) {
+    uint8_t buf[128];
+    if (frame.len <= sizeof(buf)) {
+      frame.payload = buf;
+      httpd_ws_recv_frame(req, &frame, sizeof(buf));
+    }
+  }
+  return ESP_OK;
 }
 
 /* ------------------------------------------------------------------ */
