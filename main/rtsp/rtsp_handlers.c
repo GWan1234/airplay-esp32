@@ -1372,6 +1372,10 @@ static void handle_setup(int socket, rtsp_conn_t *conn,
   audio_receiver_set_playing(true);
   conn->stream_paused = false;
   conn->stream_active = true;
+  // RECORD emits PLAYING on the initial connection only; a resume after a
+  // stream TEARDOWN sends just a new SETUP, so emit it here too or the DAC
+  // stays in the standby it entered on pause and the stream plays silent.
+  rtsp_events_emit(RTSP_EVENT_PLAYING, NULL);
 }
 
 static void handle_record(int socket, rtsp_conn_t *conn,
