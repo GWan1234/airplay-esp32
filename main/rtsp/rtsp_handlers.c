@@ -1798,6 +1798,16 @@ static void handle_teardown(int socket, rtsp_conn_t *conn,
   // TEARDOWN without streams = full session teardown (disconnect)
   ESP_LOGI(TAG, "TEARDOWN: has_streams=%d stream_count=%zu", has_streams,
            stream_count);
+  // Stream-level teardown is a pause: freeze playout immediately so audio
+  // silences on ALL boards. playing=false makes the output emit silence at
+  // once (software mute, for software-volume/DAC-less boards); the synchronous
+  // PAUSED event mutes the hardware DAC.  Both run ahead of the slower
+  // receiver/decoder teardown below (audio_receiver_stop can block ~1 s
+  // waiting for the listener task to exit).
+  if (has_streams) {
+    audio_receiver_set_playing(false);
+    rtsp_events_emit(RTSP_EVENT_PAUSED, NULL);
+  }
   audio_receiver_stop();
   audio_output_flush();
   // Drop PTP lock + offset history.  AirPlay group rejoins reuse the same
@@ -1809,10 +1819,7 @@ static void handle_teardown(int socket, rtsp_conn_t *conn,
   conn->stream_paused =
       has_streams; // Keep session ready if only streams torn down
 
-  if (has_streams) {
-    // Stream-level teardown — session still open, iOS considers this paused
-    rtsp_events_emit(RTSP_EVENT_PAUSED, NULL);
-  } else {
+  if (!has_streams) {
     // Full teardown — server cleanup will emit RTSP_EVENT_DISCONNECTED
     // when the TCP connection closes.
     // For v1 sessions, keep the DACP session alive across teardown so the
@@ -1883,10 +1890,11 @@ static void handle_setrateanchortime(int socket, rtsp_conn_t *conn,
 
   if (rate == 0.0) {
     ESP_LOGI(TAG, "SETRATEANCHORTIME: rate=0 -> PAUSING");
+    // Mute the DAC first via the synchronous event so audio stops now.
+    rtsp_events_emit(RTSP_EVENT_PAUSED, NULL);
     conn->stream_paused = true;
     audio_receiver_pause();
     audio_output_flush();
-    rtsp_events_emit(RTSP_EVENT_PAUSED, NULL);
   } else {
     ESP_LOGI(TAG, "SETRATEANCHORTIME: rate=%.1f -> RESUMING (was_paused=%d)",
              rate, conn->stream_paused);
