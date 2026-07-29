@@ -57,6 +57,7 @@ endif()
 # Bluetooth A2DP sink (only available on ESP32 with Classic BT)
 if(CONFIG_BT_A2DP_ENABLE)
     list(APPEND SRC_FILES "audio/a2dp_sink.c")
+    list(APPEND SRC_FILES "bt_coex.c")
 endif()
 
 # W5500 SPI Ethernet

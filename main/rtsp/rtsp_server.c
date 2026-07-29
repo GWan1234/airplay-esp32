@@ -2,6 +2,7 @@
 
 #include <errno.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
@@ -192,6 +193,12 @@ static void client_task(void *pvParameters) {
   // Socket timeout for stop signal responsiveness
   struct timeval tv = {.tv_sec = 1, .tv_usec = 0};
   setsockopt(slot->socket, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+  // Disable Nagle: RTSP control commands (volume, pause) are tiny and must
+  // not wait for coalescing/delayed-ACK, which adds tens to hundreds of ms of
+  // latency to every command on this connection.
+  int nodelay = 1;
+  setsockopt(slot->socket, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
 
   while (server_running && !slot->should_stop) {
     if (conn->encrypted_mode) {

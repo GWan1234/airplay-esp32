@@ -20,10 +20,12 @@
 
 #ifdef CONFIG_BT_A2DP_ENABLE
 #include "a2dp_sink.h"
+#include "bt_coex.h"
 #include "rtsp_events.h"
 #endif
 
 #include "iot_board.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -149,9 +151,11 @@ static void on_bt_state_changed(bool connected) {
   if (connected) {
     ESP_LOGI(TAG, "BT connected — disabling AirPlay");
     stop_airplay_services();
+    bt_coex_post(BT_COEX_EVT_BT_CONNECTED);
     playback_control_set_source(PLAYBACK_SOURCE_BLUETOOTH);
   } else {
     ESP_LOGI(TAG, "BT disconnected — re-enabling AirPlay");
+    bt_coex_post(BT_COEX_EVT_BT_DISCONNECTED);
     playback_control_set_source(PLAYBACK_SOURCE_NONE);
     if (ethernet_is_connected() || wifi_is_connected()) {
       start_airplay_services();
@@ -171,15 +175,21 @@ static void on_airplay_client_event(rtsp_event_t event,
   case RTSP_EVENT_CLIENT_CONNECTED:
     ESP_LOGI(TAG, "AirPlay client connected — disabling BT");
     bt_a2dp_sink_set_discoverable(false);
+    bt_coex_post(BT_COEX_EVT_AIRPLAY_CONNECTED);
+    break;
+  case RTSP_EVENT_PLAYING:
+    bt_coex_post(BT_COEX_EVT_AIRPLAY_PLAYING);
     break;
   case RTSP_EVENT_PAUSED:
-    // V1 grace period active — keep BT hidden so the phone reconnects
-    // to AirPlay rather than falling back to BT.
-    ESP_LOGI(TAG, "AirPlay paused — keeping BT hidden");
+    // Session still active — BT stays suspended and hidden so the phone
+    // reconnects to AirPlay rather than falling back to BT.
+    ESP_LOGI(TAG, "AirPlay paused — keeping BT suspended and hidden");
+    bt_coex_post(BT_COEX_EVT_AIRPLAY_PAUSED);
     break;
   case RTSP_EVENT_DISCONNECTED:
-    ESP_LOGI(TAG, "AirPlay client disconnected — enabling BT");
+    ESP_LOGI(TAG, "AirPlay client disconnected — BT resumes after idle delay");
     bt_a2dp_sink_set_discoverable(true);
+    bt_coex_post(BT_COEX_EVT_AIRPLAY_DISCONNECTED);
     break;
   default:
     break;
@@ -282,10 +292,23 @@ void app_main(void) {
     if (bt_err != ESP_OK) {
       ESP_LOGE(TAG, "BT A2DP init failed: %s", esp_err_to_name(bt_err));
     } else {
+      if (bt_coex_start() != ESP_OK) {
+        ESP_LOGE(TAG, "BT coexistence task start failed");
+      }
       rtsp_events_register(on_airplay_client_event, NULL);
     }
   }
 #endif
+
+  // Boot baseline: free internal DRAM once WiFi (and BT, where enabled) are
+  // resident but before any stream is active.  Compare against the
+  // "Buffered start" log to see the headroom available for WiFi/TCP buffers.
+  ESP_LOGI(TAG,
+           "Boot baseline: free heap %lu internal (largest block %lu), "
+           "%lu SPIRAM",
+           (unsigned long)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+           (unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+           (unsigned long)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
 
   buttons_init();
 

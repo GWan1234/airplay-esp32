@@ -38,6 +38,7 @@
 #include "freertos/task.h"
 
 #include <inttypes.h>
+#include <stdio.h>
 #include <string.h>
 
 static const char *TAG = "bt_a2dp";
@@ -98,6 +99,11 @@ static volatile bool s_audio_started = false;
 static volatile bool s_avrc_playing = false; /* AVRCP play state (instant) */
 static volatile bool s_i2s_task_running = false;
 static bool s_bt_discoverable = true;
+// Radio suspended (controller+bluedroid disabled) to free WiFi airtime while
+// AirPlay is streaming.  Reversible without a reboot: memory is retained.
+static bool s_bt_suspended = false;
+// Advertised BT device name, saved so it can be re-applied after a resume.
+static char s_device_name[64] = {0};
 static uint8_t s_avrc_volume = 64; /* 0-127, AVRCP absolute volume */
 static volatile bool s_vol_ntf_pending =
     false; /* phone registered for volume change */
@@ -678,17 +684,18 @@ static void bt_gap_cb(esp_bt_gap_cb_event_t event,
 /* Stack-up handler — called when Bluedroid is (re-)enabled                   */
 /* ========================================================================== */
 
-static void bt_stack_evt_handler(uint16_t event, void *param) {
-  (void)param;
-
-  if (event != BT_APP_EVT_STACK_UP) {
-    return;
-  }
-
-  ESP_LOGI(TAG, "BT stack up, initializing profiles");
-
+// Register the GAP/AVRC/A2DP profiles.  Shared by the initial stack-up path
+// and bt_a2dp_sink_resume(), so a suspend/resume cycle re-registers the L2CAP
+// PSMs cleanly instead of relying on them surviving esp_bluedroid_disable().
+static void bt_register_profiles(void) {
   // GAP
   esp_bt_gap_register_callback(bt_gap_cb);
+
+  // (Re-)apply the advertised device name.  Required after a resume because
+  // the name does not survive esp_bluedroid_disable().
+  if (s_device_name[0] != '\0') {
+    esp_bt_gap_set_device_name(s_device_name);
+  }
 
 #ifdef CONFIG_BT_SSP_ENABLED
   // Secure Simple Pairing — numeric comparison for BT 2.1+ devices
@@ -724,6 +731,53 @@ static void bt_stack_evt_handler(uint16_t event, void *param) {
   esp_a2d_register_callback(bt_a2dp_cb);
   esp_a2d_sink_register_data_callback(bt_a2dp_data_cb);
   esp_a2d_sink_init();
+}
+
+// Deregister the profiles before suspending so their L2CAP PSMs (0x0019 AVDTP,
+// 0x0017 AVCTP) are torn down cleanly rather than during bluedroid disable.
+// Order matters: Bluedroid requires AVRC (TG then CT) to be deinited *before*
+// A2DP, otherwise it logs "AVRC should deinit in advance of A2DP".
+static void bt_deinit_profiles(void) {
+  esp_avrc_tg_deinit();
+  esp_avrc_ct_deinit();
+  esp_a2d_sink_deinit();
+}
+
+// Apply the saved connectable/discoverable preference.  Assumes bluedroid is
+// enabled and the profiles are registered.
+static void bt_apply_scan_mode(void) {
+  if (s_bt_discoverable) {
+    esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_GENERAL_DISCOVERABLE);
+  } else {
+    esp_bt_gap_set_scan_mode(ESP_BT_NON_CONNECTABLE, ESP_BT_NON_DISCOVERABLE);
+  }
+}
+
+// Push the saved BT volume to the DAC (falls back to 64 / -15 dB if none
+// stored).  Applied on stack-up and on resume, so the first A2DP playback
+// after a suspend/resume cycle starts at the correct level instead of whatever
+// AirPlay last set, without waiting for an AVRCP volume update.
+static void bt_restore_saved_volume(void) {
+  uint8_t saved_vol;
+  if (settings_get_bt_volume(&saved_vol) == ESP_OK) {
+    s_avrc_volume = saved_vol;
+  }
+  float volume_db = ((float)s_avrc_volume / 127.0f) * 30.0f - 30.0f;
+  dac_set_volume(volume_db);
+  ESP_LOGI(TAG, "BT volume restored: %d/127 (%.1f dB)", s_avrc_volume,
+           volume_db);
+}
+
+static void bt_stack_evt_handler(uint16_t event, void *param) {
+  (void)param;
+
+  if (event != BT_APP_EVT_STACK_UP) {
+    return;
+  }
+
+  ESP_LOGI(TAG, "BT stack up, initializing profiles");
+
+  bt_register_profiles();
 
   // Apply saved discoverable state
   if (s_bt_discoverable) {
@@ -733,16 +787,7 @@ static void bt_stack_evt_handler(uint16_t event, void *param) {
   }
 
   // Restore saved BT volume (falls back to 64 / -15 dB if none stored)
-  {
-    uint8_t saved_vol;
-    if (settings_get_bt_volume(&saved_vol) == ESP_OK) {
-      s_avrc_volume = saved_vol;
-    }
-    float volume_db = ((float)s_avrc_volume / 127.0f) * 30.0f - 30.0f;
-    dac_set_volume(volume_db);
-    ESP_LOGI(TAG, "BT volume restored: %d/127 (%.1f dB)", s_avrc_volume,
-             volume_db);
-  }
+  bt_restore_saved_volume();
 
   ESP_LOGI(TAG, "BT A2DP sink ready, waiting for connections");
 }
@@ -791,7 +836,9 @@ esp_err_t bt_a2dp_sink_init(const char *device_name,
     return err;
   }
 
-  // Set device name
+  // Save the device name so it can be re-applied after a suspend/resume; the
+  // stack-up profile registration (bt_register_profiles) applies it.
+  snprintf(s_device_name, sizeof(s_device_name), "%s", device_name);
   esp_bt_gap_set_device_name(device_name);
 
   // Create the BT app task and event queue
@@ -821,7 +868,9 @@ bool bt_a2dp_sink_is_connected(void) {
 
 void bt_a2dp_sink_set_discoverable(bool discoverable) {
   s_bt_discoverable = discoverable;
-  if (s_connected) {
+  if (s_connected || s_bt_suspended) {
+    // Suspended: only the saved preference is updated; the scan mode is
+    // re-applied by bt_a2dp_sink_resume().
     return;
   }
   if (discoverable) {
@@ -831,6 +880,158 @@ void bt_a2dp_sink_set_discoverable(bool discoverable) {
     ESP_LOGI(TAG, "BT discoverable disabled");
     esp_bt_gap_set_scan_mode(ESP_BT_NON_CONNECTABLE, ESP_BT_NON_DISCOVERABLE);
   }
+}
+
+bool bt_a2dp_sink_is_suspended(void) {
+  return s_bt_suspended;
+}
+
+static esp_err_t bt_suspend_locked(void) {
+  if (s_bt_suspended) {
+    return ESP_OK;
+  }
+  if (s_connected) {
+    // A phone is actively streaming over BT — don't pull the radio out from
+    // under it.  (Shouldn't happen while AirPlay is the active source.)
+    ESP_LOGW(TAG, "Not suspending BT: A2DP device connected");
+    return ESP_ERR_INVALID_STATE;
+  }
+
+  ESP_LOGI(TAG, "Suspending Bluetooth radio (freeing airtime for WiFi)");
+  // Stop accepting connections before tearing the radio down.
+  esp_bt_gap_set_scan_mode(ESP_BT_NON_CONNECTABLE, ESP_BT_NON_DISCOVERABLE);
+
+  // Deregister profiles first so their L2CAP PSMs are removed cleanly (avoids
+  // the "PSM not found for deregistration" warnings during bluedroid disable).
+  bt_deinit_profiles();
+
+  // Re-check after tearing down the A2DP/AVRC profiles: a device may have
+  // completed its connection during the scan-mode/deinit window (between the
+  // initial s_connected check and here).  Now that the profiles are gone no
+  // new connection can complete, so if one did, abort the suspend and restore
+  // the profiles rather than disabling the radio out from under a live link.
+  if (s_connected) {
+    ESP_LOGW(TAG, "BT connected mid-suspend — aborting, restoring profiles");
+    bt_register_profiles();
+    bt_apply_scan_mode();
+    return ESP_ERR_INVALID_STATE;
+  }
+
+  esp_err_t err = esp_bluedroid_disable();
+  if (err != ESP_OK) {
+    // Bluedroid is still enabled; re-register the profiles we just tore down
+    // so BT stays functional rather than being left half-dismantled.
+    ESP_LOGE(TAG, "bluedroid disable failed: %s — restoring profiles",
+             esp_err_to_name(err));
+    bt_register_profiles();
+    bt_apply_scan_mode();
+    return err;
+  }
+  err = esp_bt_controller_disable();
+  if (err != ESP_OK) {
+    // Roll bluedroid back up and re-register the profiles so BT is restored to
+    // a working, non-suspended state instead of being bricked until reboot.
+    ESP_LOGE(TAG, "controller disable failed: %s — rolling back",
+             esp_err_to_name(err));
+    if (esp_bluedroid_enable() == ESP_OK) {
+      bt_register_profiles();
+      bt_apply_scan_mode();
+    } else {
+      ESP_LOGE(TAG, "bluedroid re-enable failed during rollback — "
+                    "BT unavailable until reboot");
+    }
+    return err;
+  }
+
+  s_bt_suspended = true;
+  return ESP_OK;
+}
+
+static esp_err_t bt_resume_locked(void) {
+  if (!s_bt_suspended) {
+    return ESP_OK;
+  }
+
+  ESP_LOGI(TAG, "Resuming Bluetooth radio");
+  esp_err_t err = esp_bt_controller_enable(ESP_BT_MODE_CLASSIC_BT);
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG, "controller enable failed: %s", esp_err_to_name(err));
+    return err;
+  }
+  err = esp_bluedroid_enable();
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG, "bluedroid enable failed: %s", esp_err_to_name(err));
+    esp_bt_controller_disable(); // roll back to a consistent suspended state
+    return err;
+  }
+
+  s_bt_suspended = false;
+  // Re-register the profiles torn down in suspend, restore the connectable/
+  // discoverable state, and re-apply the saved BT volume to the DAC (AirPlay
+  // may have changed it) so post-resume A2DP starts at the right level.
+  bt_register_profiles();
+  bt_apply_scan_mode();
+  bt_restore_saved_volume();
+  return ESP_OK;
+}
+
+// ---------------------------------------------------------------------------
+// Suspend/resume mutate the Bluedroid stack (profile deinit/init, controller
+// enable/disable).  They must not run directly on the caller's (coex) task
+// because bt_app_task keeps dispatching A2DP/AVRC handlers — tearing the stack
+// down or rebuilding it under an in-flight callback races them.  Instead run
+// the operation on bt_app_task itself (the same serialised queue that stack-up
+// uses) and block the caller until it finishes, returning its result.
+// ---------------------------------------------------------------------------
+typedef struct {
+  esp_err_t (*fn)(void);
+  esp_err_t result;
+  SemaphoreHandle_t done;
+} bt_sync_op_t;
+
+// Only ever one op is in flight: bt_run_on_app_task blocks until it completes,
+// and its sole caller (the coex task) issues them serially.
+static bt_sync_op_t *s_pending_op;
+
+static void bt_sync_op_runner(uint16_t event, void *param) {
+  (void)event;
+  (void)param;
+  bt_sync_op_t *op = s_pending_op;
+  op->result = op->fn();
+  xSemaphoreGive(op->done);
+}
+
+static esp_err_t bt_run_on_app_task(esp_err_t (*fn)(void)) {
+  if (!s_bt_task_queue) {
+    return ESP_ERR_INVALID_STATE;
+  }
+  // If somehow invoked from bt_app_task itself, run inline — dispatching to our
+  // own queue and then blocking on it would dead-lock.
+  if (xTaskGetCurrentTaskHandle() == s_bt_task_handle) {
+    return fn();
+  }
+
+  bt_sync_op_t op = {.fn = fn, .result = ESP_FAIL, .done = NULL};
+  op.done = xSemaphoreCreateBinary();
+  if (!op.done) {
+    return ESP_ERR_NO_MEM;
+  }
+  s_pending_op = &op;
+  if (!bt_app_work_dispatch(bt_sync_op_runner, 0, NULL, 0)) {
+    vSemaphoreDelete(op.done);
+    return ESP_FAIL;
+  }
+  xSemaphoreTake(op.done, portMAX_DELAY);
+  vSemaphoreDelete(op.done);
+  return op.result;
+}
+
+esp_err_t bt_a2dp_sink_suspend(void) {
+  return bt_run_on_app_task(bt_suspend_locked);
+}
+
+esp_err_t bt_a2dp_sink_resume(void) {
+  return bt_run_on_app_task(bt_resume_locked);
 }
 
 // ============================================================================

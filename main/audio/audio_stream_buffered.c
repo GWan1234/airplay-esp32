@@ -132,6 +132,14 @@ static void buffered_audio_task(void *pvParameters) {
       uint32_t timestamp =
           (packet[4] << 24) | (packet[5] << 16) | (packet[6] << 8) | packet[7];
 
+      // Drop stale pre-seek/old-track packets before AES and AAC work.  The
+      // bytes still have to be drained from TCP (done above), but they no
+      // longer consume decoder time or enter the PCM ring buffer.
+      if (!audio_stream_accept_timestamp(state, timestamp)) {
+        state->stats.packets_dropped++;
+        continue;
+      }
+
       uint8_t *decrypted = state->decrypt_buffer;
       size_t decrypt_capacity = state->decrypt_buffer_size;
       if (!decrypted) {
@@ -153,8 +161,8 @@ static void buffered_audio_task(void *pvParameters) {
       state->blocks_read++;
       state->blocks_read_in_sequence++;
 
-      if (!audio_stream_process_frame(state, timestamp, decrypted,
-                                      (size_t)decrypted_len)) {
+      if (!audio_stream_process_accepted_frame(state, timestamp, decrypted,
+                                               (size_t)decrypted_len)) {
         state->stats.packets_dropped++;
       }
     }
@@ -210,6 +218,16 @@ static esp_err_t buffered_start(audio_stream_t *stream, uint16_t port) {
     stream->running = false;
     return ESP_FAIL;
   }
+
+  // Worst-case memory snapshot: buffered streaming is the heaviest concurrent
+  // load (WiFi + lwip + decoder + PCM ring, plus BT controller resident on
+  // squeezeamp-bt).  Use this to size WiFi/TCP buffers without risking OOM.
+  ESP_LOGI(TAG,
+           "Buffered start: free heap %lu internal (largest block %lu), "
+           "%lu SPIRAM",
+           (unsigned long)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+           (unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+           (unsigned long)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
 
   return ESP_OK;
 }

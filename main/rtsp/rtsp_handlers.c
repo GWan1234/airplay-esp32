@@ -81,6 +81,12 @@ bool rtsp_codec_configure(int64_t type_id, audio_format_t *fmt,
 
 // Event port task state
 #define EVENT_STACK_SIZE 3072
+
+// Default playout latency for realtime (type 96) streams when SETUP does not
+// carry a usable latencyMin: 11025 samples = 250 ms at 44.1 kHz.  This is the
+// standard AirPlay realtime-stream minimum latency; senders transmit audio
+// ~2 s (88200 samples) ahead of this deadline.
+#define AIRPLAY_RT_LATENCY_DEFAULT_SAMPLES 11025
 static int event_client_socket = -1;
 static int event_listen_socket = -1;
 static TaskHandle_t event_task_handle = NULL;
@@ -1270,6 +1276,49 @@ static void handle_setup(int socket, rtsp_conn_t *conn,
     return;
   }
 
+  // Playout latency.  For REALTIME streams (type 96) the anchor from
+  // SETRATEANCHORTIME maps an RTP timestamp onto the sender's source
+  // timeline; actual playout is expected latencyMin samples later.  Every
+  // reference receiver applies this, so playing at the anchor directly puts
+  // this device ~250 ms AHEAD of the rest of a multi-room group (issue #54:
+  // an empirical +300 ms offset on a build that subtracted 46 ms of
+  // hardware latency — net +254 ms — gave near-perfect sync; 11025 samples
+  // is 250.0 ms).  Use the sender's latencyMin from the SETUP stream dict
+  // when present and sane, else the AirPlay default of 11025.
+  // Buffered streams (type 103) schedule playout with the anchor directly.
+  // Only applied on the AirPlay 2 (bplist SETUP) path; the AirPlay 1 path
+  // keeps its existing behavior (0) — no field evidence either way there.
+  if (!is_bplist || buffered) {
+    audio_receiver_set_playout_latency_samples(0);
+  } else {
+    int64_t latency_min = 0;
+    const char *latency_src = "default";
+    // latencyMin is a per-stream key inside the SETUP streams[] dict, not a
+    // top-level key — read it the same way as ct/sr/spf above.
+    if (body && body_len > 0) {
+      bplist_kv_info_t kv[16];
+      size_t kv_count = 0;
+      if (bplist_get_stream_kv_info(body, body_len, 0, kv, 16, &kv_count)) {
+        for (size_t k = 0; k < kv_count; k++) {
+          if (kv[k].value_type == BPLIST_VALUE_INT &&
+              strcmp(kv[k].key, "latencyMin") == 0) {
+            latency_min = kv[k].int_value;
+            break;
+          }
+        }
+      }
+    }
+    if (latency_min > 0 && latency_min <= 5 * 44100) {
+      latency_src = "SETUP latencyMin";
+    } else {
+      latency_min = AIRPLAY_RT_LATENCY_DEFAULT_SAMPLES;
+    }
+    audio_receiver_set_playout_latency_samples((uint32_t)latency_min);
+    ESP_LOGI(TAG, "Realtime playout latency: %lld samples (%lld ms, %s)",
+             (long long)latency_min, (long long)(latency_min * 1000 / 44100),
+             latency_src);
+  }
+
   if (is_bplist) {
     uint8_t plist_body[256];
     size_t plist_len = bplist_build_stream_setup(
@@ -1323,6 +1372,10 @@ static void handle_setup(int socket, rtsp_conn_t *conn,
   audio_receiver_set_playing(true);
   conn->stream_paused = false;
   conn->stream_active = true;
+  // RECORD emits PLAYING on the initial connection only; a resume after a
+  // stream TEARDOWN sends just a new SETUP, so emit it here too or the DAC
+  // stays in the standby it entered on pause and the stream plays silent.
+  rtsp_events_emit(RTSP_EVENT_PLAYING, NULL);
 }
 
 static void handle_record(int socket, rtsp_conn_t *conn,
@@ -1745,6 +1798,16 @@ static void handle_teardown(int socket, rtsp_conn_t *conn,
   // TEARDOWN without streams = full session teardown (disconnect)
   ESP_LOGI(TAG, "TEARDOWN: has_streams=%d stream_count=%zu", has_streams,
            stream_count);
+  // Stream-level teardown is a pause: freeze playout immediately so audio
+  // silences on ALL boards. playing=false makes the output emit silence at
+  // once (software mute, for software-volume/DAC-less boards); the synchronous
+  // PAUSED event mutes the hardware DAC.  Both run ahead of the slower
+  // receiver/decoder teardown below (audio_receiver_stop can block ~1 s
+  // waiting for the listener task to exit).
+  if (has_streams) {
+    audio_receiver_set_playing(false);
+    rtsp_events_emit(RTSP_EVENT_PAUSED, NULL);
+  }
   audio_receiver_stop();
   audio_output_flush();
   // Drop PTP lock + offset history.  AirPlay group rejoins reuse the same
@@ -1756,10 +1819,7 @@ static void handle_teardown(int socket, rtsp_conn_t *conn,
   conn->stream_paused =
       has_streams; // Keep session ready if only streams torn down
 
-  if (has_streams) {
-    // Stream-level teardown — session still open, iOS considers this paused
-    rtsp_events_emit(RTSP_EVENT_PAUSED, NULL);
-  } else {
+  if (!has_streams) {
     // Full teardown — server cleanup will emit RTSP_EVENT_DISCONNECTED
     // when the TCP connection closes.
     // For v1 sessions, keep the DACP session alive across teardown so the
@@ -1830,10 +1890,11 @@ static void handle_setrateanchortime(int socket, rtsp_conn_t *conn,
 
   if (rate == 0.0) {
     ESP_LOGI(TAG, "SETRATEANCHORTIME: rate=0 -> PAUSING");
+    // Mute the DAC first via the synchronous event so audio stops now.
+    rtsp_events_emit(RTSP_EVENT_PAUSED, NULL);
     conn->stream_paused = true;
     audio_receiver_pause();
     audio_output_flush();
-    rtsp_events_emit(RTSP_EVENT_PAUSED, NULL);
   } else {
     ESP_LOGI(TAG, "SETRATEANCHORTIME: rate=%.1f -> RESUMING (was_paused=%d)",
              rate, conn->stream_paused);

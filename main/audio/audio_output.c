@@ -56,9 +56,29 @@ static volatile audio_channel_mode_t channel_mode = AUDIO_CHANNEL_STEREO;
 
 static void apply_volume(int16_t *buf, size_t n) {
 #ifndef CONFIG_DAC_CONTROLS_VOLUME
-  int32_t vol = airplay_get_volume_q15();
+  // Ramp toward the target gain instead of applying volume changes
+  // instantly.  An abrupt gain step mid-waveform is a discontinuity scaled
+  // by the signal's current amplitude — the classic volume "zipper" click,
+  // audible on every step of the sender's volume slider.  Approach the
+  // target exponentially, stepping once per stereo frame (even indices) so
+  // both channels always carry the same gain; the /256 divisor gives a
+  // ~3 ms time constant and a worst-case per-frame gain step of ~0.4%,
+  // with a minimum step of 1 so the ramp always completes.
+  static int32_t cur_q15 = -1;
+  int32_t target = airplay_get_volume_q15();
+  if (cur_q15 < 0) {
+    cur_q15 = target; // first call: no audio has played yet, jump silently
+  }
   for (size_t i = 0; i < n; i++) {
-    buf[i] = (int16_t)(((int32_t)buf[i] * vol) >> 15);
+    if ((i & 1) == 0 && cur_q15 != target) {
+      int32_t diff = target - cur_q15;
+      int32_t step = diff / 256;
+      if (step == 0) {
+        step = diff > 0 ? 1 : -1;
+      }
+      cur_q15 += step;
+    }
+    buf[i] = (int16_t)(((int32_t)buf[i] * cur_q15) >> 15);
   }
 #endif
 }
@@ -107,7 +127,6 @@ static void playback_task(void *arg) {
     }
     size_t samples = audio_receiver_read(pcm, FRAME_SAMPLES + 1);
     if (samples > 0) {
-      ESP_LOGD(TAG, "Read %u samples from receiver", (unsigned int)samples);
       int16_t *play_buf = pcm;
       size_t play_samples = samples;
       if (audio_resample_is_active()) {
@@ -115,20 +134,20 @@ static void playback_task(void *arg) {
                                               MAX_RESAMPLE_FRAMES);
         play_buf = resample_buf;
       }
-      ESP_LOGD(TAG, "Resampled to %u samples", (unsigned int)play_samples);
       apply_volume(play_buf, play_samples * 2);
       apply_channel_mode(play_buf, play_samples);
       led_audio_feed(play_buf, play_samples);
-      i2s_channel_write(tx_handle, play_buf, play_samples * 4, &written,
-                        portMAX_DELAY);
-      ESP_LOGD(TAG, "I2S write: %u bytes written", (unsigned int)written);
+      i2s_channel_write(tx_handle, play_buf, play_samples * 2 * sizeof(int16_t),
+                        &written, portMAX_DELAY);
       taskYIELD();
     } else {
-      // ESP_LOGW(TAG, "Receiver underflow - playing silence");
+      // Receiver underflow — output a frame of silence.  Block on the DMA
+      // write (portMAX_DELAY) so the write itself paces the loop, instead of a
+      // short timeout plus vTaskDelay(1) which produced jittery silence.
       led_audio_feed(silence, FRAME_SAMPLES);
-      i2s_channel_write(tx_handle, silence, (size_t)FRAME_SAMPLES * 4, &written,
-                        pdMS_TO_TICKS(10));
-      vTaskDelay(1);
+      i2s_channel_write(tx_handle, silence,
+                        (size_t)FRAME_SAMPLES * 2 * sizeof(int16_t), &written,
+                        portMAX_DELAY);
     }
   }
 
@@ -143,6 +162,13 @@ esp_err_t audio_output_init(void) {
       I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
   chan_cfg.dma_desc_num = I2S_DMA_DESC_NUM;
   chan_cfg.dma_frame_num = I2S_DMA_FRAME_NUM;
+  // Zero each DMA descriptor after it is sent.  Without this, a writer
+  // stall longer than the DMA ring (~46 ms — e.g. an NVS/flash write
+  // disabling the cache, or a CPU burst from the web server) makes the
+  // hardware REPLAY the stale ring contents in a loop: a loud stutter, then
+  // a second discontinuity on recovery.  With auto_clear an underrun
+  // degrades to plain silence.
+  chan_cfg.auto_clear = true;
 
   ESP_RETURN_ON_ERROR(i2s_new_channel(&chan_cfg, &tx_handle, NULL), TAG,
                       "channel create failed");
@@ -242,9 +268,24 @@ void audio_output_set_source_rate(int rate) {
 }
 
 uint32_t audio_output_get_hardware_latency_us(void) {
-  return (
-      uint32_t)(((uint64_t)I2S_DMA_DESC_NUM * I2S_DMA_FRAME_NUM * 1000000ULL) /
-                OUTPUT_RATE);
+  // Delay between i2s_channel_write() accepting a sample and that sample
+  // leaving the DAC.  This is the DMA ring occupancy AHEAD of the newly
+  // written data, which is NOT the full ring: i2s_channel_write() blocks
+  // only until space frees, so the writer refills as soon as a descriptor
+  // completes and steady-state occupancy oscillates between
+  // (DESC_NUM - 1) and DESC_NUM descriptors.
+  //
+  // Using the full ring (DESC_NUM) overstates the delay by half a
+  // descriptor on average — 2.9 ms at 44.1 kHz with the config below — and
+  // that bias lands directly in compute_early_us(), pushing every frame
+  // toward the "late" side of the threshold.  Model the midpoint instead:
+  //   (DESC_NUM - 0.5) x FRAME_NUM == (2*DESC_NUM - 1) x FRAME_NUM / 2
+  // The residual +/-2.9 ms swing is real jitter that the drift servo in
+  // audio_timing.c absorbs; only the constant bias is removed here.
+  return (uint32_t)((((uint64_t)(2 * I2S_DMA_DESC_NUM - 1) * I2S_DMA_FRAME_NUM *
+                      1000000ULL) /
+                     2) /
+                    OUTPUT_RATE);
 }
 
 audio_channel_mode_t audio_output_cycle_channel_mode(void) {

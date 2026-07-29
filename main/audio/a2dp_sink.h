@@ -47,6 +47,26 @@ bool bt_a2dp_sink_is_connected(void);
 void bt_a2dp_sink_set_discoverable(bool discoverable);
 
 /**
+ * Suspend the Bluetooth radio: disables Bluedroid and the BT controller so the
+ * WiFi/BT coexistence arbiter hands all radio airtime to WiFi.  Memory is
+ * retained, so bt_a2dp_sink_resume() restores BT without a reboot.  Used to
+ * free the radio for WiFi while AirPlay is the active source.
+ * No-op if already suspended; refuses if a BT device is currently connected.
+ */
+esp_err_t bt_a2dp_sink_suspend(void);
+
+/**
+ * Resume the Bluetooth radio after bt_a2dp_sink_suspend(), restoring the
+ * previously saved discoverable/connectable state.  No-op if not suspended.
+ */
+esp_err_t bt_a2dp_sink_resume(void);
+
+/**
+ * @return true while the BT radio is suspended (see bt_a2dp_sink_suspend()).
+ */
+bool bt_a2dp_sink_is_suspended(void);
+
+/**
  * AVRCP passthrough commands for hardware button control.
  * These send commands to the connected BT source device.
  */

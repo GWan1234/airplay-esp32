@@ -167,6 +167,10 @@ void audio_receiver_set_encryption(const audio_encrypt_t *encrypt) {
   }
 }
 
+void audio_receiver_set_playout_latency_samples(uint32_t latency_samples) {
+  audio_timing_set_playout_latency(&receiver.timing, latency_samples);
+}
+
 void audio_receiver_set_output_latency_us(uint32_t latency_us) {
   if (!receiver.stream) {
     return;
@@ -295,6 +299,7 @@ void audio_receiver_set_anchor_time(uint64_t clock_id, uint64_t network_time_ns,
       receiver.timing.pending_frame_len = 0;
       receiver.timing.ready_time_us = 0;
       receiver.timing.deferred_flush_pending = false;
+      audio_timing_reset_continuity(&receiver.timing);
       receiver.blocks_read_in_sequence = 0;
       receiver.discard_before_rtp = rtp_time;
       receiver.discard_before_rtp_valid = true;
@@ -335,6 +340,7 @@ void audio_receiver_set_anchor_time(uint64_t clock_id, uint64_t network_time_ns,
       receiver.timing.pending_frame_len = 0;
       receiver.timing.ready_time_us = 0;
       receiver.timing.deferred_flush_pending = false;
+      audio_timing_reset_continuity(&receiver.timing);
       receiver.blocks_read_in_sequence = 0;
       receiver.timing.quick_start = true;
       if (!gates_armed) {
