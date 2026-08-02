@@ -859,6 +859,8 @@ static esp_err_t tas58xx_deinit(void) {
 }
 
 /* Apply a power mode to a single chip. Assumes REG_LOCK is held. */
+static uint8_t tas58xx_dig_vol_reg(const tas58xx_dev_t *dev);
+
 static void set_power_mode_dev(tas58xx_dev_t *dev, dac_power_mode_t mode) {
   s_cur = dev;
   uint8_t cur_ctrl2 = 0;
@@ -891,7 +893,6 @@ static void set_power_mode_dev(tas58xx_dev_t *dev, dac_power_mode_t mode) {
       tas58xx_write_reg(REG_DIG_VOL_CTRL1, 0x33);
       tas58xx_write_reg(REG_AUTO_MUTE_CTRL, 0x07);
       tas58xx_write_reg(REG_AUTO_MUTE_TIME, 0x00);
-      tas58xx_write_reg(REG_DIG_VOL, DIG_VOL_0DB);
       tas58xx_write_reg(REG_AGAIN, 0x00);
 
       /* Coefficient RAM may be invalid after DEEP_SLEEP — force
@@ -902,6 +903,10 @@ static void set_power_mode_dev(tas58xx_dev_t *dev, dac_power_mode_t mode) {
     /* DEVICE_CTRL1 is reset by DEEP_SLEEP and the device is in HiZ here, so
      * re-bridge the outputs before the output stage is allowed to drive. */
     tas58xx_apply_pbtl(dev);
+
+    /* DEEP_SLEEP also resets DIG_VOL to 0 dB, which would be a full-scale
+     * blast on the first frame after PLAY. */
+    tas58xx_write_reg(REG_DIG_VOL, tas58xx_dig_vol_reg(dev));
 
     // Clear any faults accumulated while clocks were absent
     tas58xx_write_reg(REG_FAULT_CLEAR, 0x80);
@@ -1062,21 +1067,24 @@ static uint8_t tas58xx_db_to_reg(float db_level) {
   return (uint8_t)raw;
 }
 
+// DIG_VOL value this chip should hold at the current master volume.
+static uint8_t tas58xx_dig_vol_reg(const tas58xx_dev_t *dev) {
+  float db = tas58xx_map_volume_db(s_last_airplay_db);
+  if (dev->pbtl_mono) {
+    db += s_sub_offset_db;
+  }
+  return tas58xx_db_to_reg(db);
+}
+
 // Re-apply the cached master volume to every chip, adding the sub level trim
 // to any sub (PBTL mono) device. Assumes REG_LOCK is held.
 static void tas58xx_apply_volume_locked(void) {
-  float base_db = tas58xx_map_volume_db(s_last_airplay_db);
-  uint8_t main_reg = tas58xx_db_to_reg(base_db);
-  uint8_t sub_reg = tas58xx_db_to_reg(base_db + s_sub_offset_db);
-
-  ESP_LOGD(TAG,
-           "Volume: AirPlay %.1f dB -> DAC %.1f dB (main 0x%02X, sub %+.1f dB "
-           "0x%02X)",
-           s_last_airplay_db, base_db, main_reg, s_sub_offset_db, sub_reg);
+  ESP_LOGD(TAG, "Volume: AirPlay %.1f dB (sub trim %+.1f dB)",
+           s_last_airplay_db, s_sub_offset_db);
 
   for (int i = 0; i < s_dev_count; i++) {
     s_cur = &s_devs[i];
-    tas58xx_write_reg(REG_DIG_VOL, s_devs[i].pbtl_mono ? sub_reg : main_reg);
+    tas58xx_write_reg(REG_DIG_VOL, tas58xx_dig_vol_reg(&s_devs[i]));
   }
   s_cur = NULL;
 }

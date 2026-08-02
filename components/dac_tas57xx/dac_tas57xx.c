@@ -290,6 +290,8 @@ static esp_err_t tas57xx_deinit(void) {
   return err;
 }
 
+static void tas57xx_apply_volume_locked(void);
+
 /**
  * Re-apply HF config (or PBTL fallback) and init registers after a full
  * shutdown. Shutdown (reg 0x02=0x01) loses miniDSP RAM contents.
@@ -309,6 +311,8 @@ static void tas57xx_restore_config(void) {
                       &tas57xx_init_seq[k].value, sizeof(uint8_t));
     }
   }
+  /* The init sequence parks the volume at -70 dB. */
+  tas57xx_apply_volume_locked();
 }
 
 static void tas57xx_enable_speaker(bool enable) {
