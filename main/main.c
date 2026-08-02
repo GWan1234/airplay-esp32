@@ -231,10 +231,33 @@ void app_main(void) {
   if (settings_get_sub_crossover(&sub_xo) == ESP_OK) {
     dac_tas58xx_set_sub_crossover_hz(sub_xo);
   }
+  static float sub_eq[2][SETTINGS_WAY_BANDS];
+  if (settings_get_sub_eq(sub_eq) == ESP_OK) {
+    dac_tas58xx_sub_eq_set_gains(TAS58XX_WAY_LOW, sub_eq[0]);
+    dac_tas58xx_sub_eq_set_gains(TAS58XX_WAY_HIGH, sub_eq[1]);
+  }
   // Second-amplifier role must be known before the DAC is initialised.
   uint8_t dual_mode;
   if (settings_get_dual_mode(&dual_mode) == ESP_OK) {
+    if (!TAS58XX_BIAMP_SUPPORTED && dual_mode == TAS58XX_DUAL_BIAMP) {
+      dual_mode = TAS58XX_DUAL_SUB;
+    }
     dac_tas58xx_set_dual_mode((tas58xx_dual_mode_t)dual_mode);
+  }
+  float biamp_xo;
+  if (settings_get_biamp_crossover(&biamp_xo) == ESP_OK) {
+    dac_tas58xx_set_biamp_crossover_hz(biamp_xo);
+  }
+  bool biamp_swap;
+  if (settings_get_biamp_swap(&biamp_swap) == ESP_OK) {
+    dac_tas58xx_set_biamp_swap(biamp_swap);
+  }
+  static float biamp_eq[2][2][SETTINGS_WAY_BANDS];
+  if (settings_get_biamp_eq(biamp_eq) == ESP_OK) {
+    for (int spk = 0; spk < 2; spk++) {
+      dac_tas58xx_biamp_set_gains(spk, TAS58XX_WAY_LOW, biamp_eq[spk][0]);
+      dac_tas58xx_biamp_set_gains(spk, TAS58XX_WAY_HIGH, biamp_eq[spk][1]);
+    }
   }
 #endif
   spiffs_storage_init();

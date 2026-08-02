@@ -44,11 +44,16 @@ body{font-family:-apple-system,system-ui,sans-serif;background:linear-gradient(1
 .slider-row input[type=range]{flex:1;accent-color:#e94560}
 .slider-row span{font-size:13px;color:#888;min-width:60px;text-align:right}
 .hint{color:#888;font-size:12px;margin-top:6px}
+.tabs{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:12px}
+.tab{background:rgba(255,255,255,0.08);border:1px solid rgba(255,255,255,0.1);border-radius:8px;color:#aaa;padding:8px 12px;font-size:12px;cursor:pointer}
+.tab.on{background:#e94560;border-color:#e94560;color:#fff}
+.form-group select{width:100%;background:rgba(0,0,0,0.3);border:1px solid rgba(255,255,255,0.1);border-radius:8px;color:#fff;padding:10px 12px;font-size:13px;cursor:pointer}
+.form-group select option{background:#16213e}
 </style></head><body>
 <div class='wrap'>
 <div class='header'><h1>Equalizer</h1><p id='eq-subtitle'>15-Band Parametric EQ</p></div>
 <div class='nav'><a href='/'>&#8592; Back to Settings</a></div>
-<div class='card'><h2>EQ Bands</h2>
+<div class='card' id='eq-card'><h2>EQ Bands</h2>
 <div style='display:flex'>
 <div class='eq-scale'><span>+15</span><span>+7</span><span>0</span><span>-7</span><span>-15</span></div>
 <div class='eq-container' id='eq-sliders'></div>
@@ -75,17 +80,51 @@ body{font-family:-apple-system,system-ui,sans-serif;background:linear-gradient(1
 <div class='form-group' id='xo-group' style='display:none'><label for='sub-xo'>Crossover</label>
 <div class='slider-row'><input type='range' id='sub-xo' min='0' max='400' step='10' value='0' oninput='document.getElementById("xo-hz").textContent=this.value<40?"Off":this.value+" Hz"'>
 <span id='xo-hz'>Off</span></div>
-<p class='hint'>Linkwitz-Riley 24 dB/oct. The sub is low-passed and the speakers are high-passed at this frequency.</p></div>
+<p class='hint'>Linkwitz-Riley 24 dB/oct. The sub is low-passed and the speakers are high-passed at this frequency. Moving it re-spaces the EQ bands below and resets them to flat.</p></div>
 <button class='btn btn-secondary' onclick='saveSub()'>Save Sub Settings</button>
 <div id='sub-msg'></div>
+</div>
+<div class='card' id='se-card' style='display:none'><h2>Per-Way EQ</h2>
+<div class='tabs' id='se-tabs'></div>
+<div style='display:flex'>
+<div class='eq-scale'><span>+15</span><span>+7</span><span>0</span><span>-7</span><span>-15</span></div>
+<div class='eq-container' id='se-sliders'></div>
+</div>
+<div class='eq-actions'>
+<button class='btn btn-primary' id='se-apply-btn' onclick='applySubEQ()'>Apply</button>
+<button class='btn btn-secondary' onclick='flatSubEQ()'>Reset</button>
+</div>
+<div id='se-eq-msg'></div>
+</div>
+<div class='card' id='ba-card' style='display:none'><h2>Bi-Amp Crossover</h2>
+<div class='form-group'><label for='ba-xo'>Woofer / Tweeter Crossover</label>
+<div class='slider-row'><input type='range' id='ba-xo' min='1500' max='4000' step='50' value='2500' oninput='document.getElementById("ba-xo-hz").textContent=this.value+" Hz"'>
+<span id='ba-xo-hz'>2500 Hz</span></div>
+<p class='hint'>Linkwitz-Riley 24 dB/oct. Each amplifier drives one speaker; the EQ band centres follow this frequency.</p></div>
+<div class='form-group'><label for='ba-swap'>Woofer Output</label>
+<select id='ba-swap'>
+<option value='0'>Channel A (woofer) / Channel B (tweeter)</option>
+<option value='1'>Channel B (woofer) / Channel A (tweeter)</option>
+</select></div>
+<button class='btn btn-secondary' onclick='saveBiamp()'>Save Crossover</button>
+<div id='ba-msg'></div>
+</div>
+<div class='card' id='ba-eq-card' style='display:none'><h2>Per-Driver EQ</h2>
+<div class='tabs' id='ba-tabs'></div>
+<div style='display:flex'>
+<div class='eq-scale'><span>+15</span><span>+7</span><span>0</span><span>-7</span><span>-15</span></div>
+<div class='eq-container' id='ba-sliders'></div>
+</div>
+<div class='eq-actions'>
+<button class='btn btn-primary' id='ba-apply-btn' onclick='applyBiampEQ()'>Apply</button>
+<button class='btn btn-secondary' onclick='flatBiampEQ()'>Reset</button>
+</div>
+<div id='ba-eq-msg'></div>
 </div></div>
 <script>
 var BANDS=15;
-/* Bands the DAC borrows for the crossover filter when a sub is band-limited. */
-var XOVER_BANDS=2;
 var FREQS=[20,31.5,50,80,125,200,315,500,800,'1.25k','2k','3.15k','5k','8k','16k'];
 var gains=new Array(BANDS).fill(0);
-var hiddenBands=0;
 var dirty=false;
 function fmtFreq(f){return typeof f==='number'?f+'':f;}
 function fmtGain(v){return (v>0?'+':'')+v;}
@@ -103,15 +142,78 @@ function buildSliders(){
     var f=document.createElement('div');f.className='freq';f.textContent=fmtFreq(FREQS[i]);
     d.appendChild(v);d.appendChild(s);d.appendChild(f);c.appendChild(d);
   }
-  applyXoverMask();
 }
-function applyXoverMask(){
-  var bands=document.querySelectorAll('.eq-band');
-  for(var i=0;i<bands.length;i++){
-    bands[i].style.display=i<hiddenBands?'none':'';
+
+/* ---------- Shared per-way EQ widget (2.1 and bi-amp) ---------- */
+function wayFmtFreq(f){
+  return f>=1000?(f/1000).toFixed(f>=10000?0:1)+'k':Math.round(f)+'';
+}
+function renderTabs(id,curves,current,onSelect){
+  var t=document.getElementById(id);t.innerHTML='';
+  curves.forEach(function(c){
+    var b=document.createElement('button');
+    b.className='tab'+(c.key===current?' on':'');
+    b.textContent=c.label;
+    b.onclick=function(){onSelect(c.key);};
+    t.appendChild(b);
+  });
+}
+function renderWaySliders(id,prefix,freqs,vals,onChange){
+  var c=document.getElementById(id);c.innerHTML='';
+  for(var i=0;i<vals.length;i++){
+    var d=document.createElement('div');d.className='eq-band';
+    var v=document.createElement('div');v.className='val';v.id=prefix+i;
+    v.textContent=fmtGain(vals[i]);
+    var s=document.createElement('input');s.type='range';s.min=-15;s.max=15;
+    s.step=1;s.value=vals[i];s.dataset.band=i;
+    s.addEventListener('input',function(e){
+      var b=parseInt(e.target.dataset.band,10);
+      var g=parseFloat(e.target.value);
+      document.getElementById(prefix+b).textContent=fmtGain(g);
+      onChange(b,g);
+    });
+    var f=document.createElement('div');f.className='freq';
+    f.textContent=freqs[i]!==undefined?wayFmtFreq(freqs[i]):'';
+    d.appendChild(v);d.appendChild(s);d.appendChild(f);c.appendChild(d);
   }
+}
+
+/* ---------- 2.1: sub level, crossover and the two 12-band curves ---------- */
+var SE_CURVES=[
+  {key:'sat',label:'Satellites',way:'high'},
+  {key:'sub',label:'Sub',way:'low'}
+];
+var seFreqs={low:[],high:[]};
+var seGains={sat:[],sub:[]};
+var seCurve='sat';
+var seBands=12;
+function seWayOf(key){return key==='sub'?'low':'high';}
+function seRender(){
+  renderTabs('se-tabs',SE_CURVES,seCurve,function(k){seCurve=k;seRender();});
+  renderWaySliders('se-sliders','se-val-',seFreqs[seWayOf(seCurve)],
+    seGains[seCurve],function(b,g){
+      seGains[seCurve][b]=g;
+      document.getElementById('se-apply-btn').disabled=false;
+    });
+}
+/* With a crossover engaged the DAC runs a 12-band EQ per way instead of the
+   shared 15-band one, so only one of the two cards is ever shown. */
+function seApplyMode(active){
+  document.getElementById('eq-card').style.display=active?'none':'';
+  document.getElementById('se-card').style.display=active?'':'none';
   document.getElementById('eq-subtitle').textContent=
-    (BANDS-hiddenBands)+'-Band Parametric EQ';
+    active?'':'15-Band Parametric EQ';
+  if(active){seRender();}
+}
+function seLoad(d){
+  seBands=d.bands||12;
+  seFreqs={low:d.freqs_low||[],high:d.freqs_high||[]};
+  seGains={
+    sat:(d.gains&&d.gains.sat)||new Array(seBands).fill(0),
+    sub:(d.gains&&d.gains.sub)||new Array(seBands).fill(0)
+  };
+  document.getElementById('se-apply-btn').disabled=true;
+  seApplyMode(!!d.eq_active);
 }
 async function loadSub(){
   try{var r=await fetch('/api/audio/sub');if(!r.ok)return;var d=await r.json();
@@ -120,11 +222,28 @@ async function loadSub(){
     document.getElementById('sub-db').textContent=(d.offset>0?'+':'')+d.offset+' dB';
     if(d.xo_max){var x=document.getElementById('sub-xo');x.max=d.xo_max;x.value=d.crossover||0;
       document.getElementById('xo-hz').textContent=x.value<40?'Off':x.value+' Hz';
-      document.getElementById('xo-group').style.display='';
-      hiddenBands=d.crossover>0?XOVER_BANDS:0;}
-    document.getElementById('sub-card').style.display='';}
+      document.getElementById('xo-group').style.display='';}
+    document.getElementById('sub-card').style.display='';
+    seLoad(d);}
   catch(e){console.warn('Could not load sub settings',e);}
-  applyXoverMask();
+}
+async function applySubEQ(){
+  document.getElementById('se-apply-btn').disabled=true;
+  var g={};g[seCurve]=seGains[seCurve];
+  try{var r=await fetch('/api/audio/sub',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({gains:g})});
+    var d=await r.json();
+    if(d.success){bamsg('se-eq-msg','EQ applied','ok');}
+    else{bamsg('se-eq-msg',d.error||'Failed','err');
+      document.getElementById('se-apply-btn').disabled=false;}}
+  catch(e){bamsg('se-eq-msg','Error applying EQ','err');
+    document.getElementById('se-apply-btn').disabled=false;}
+}
+function flatSubEQ(){
+  seGains[seCurve]=new Array(seBands).fill(0);
+  seRender();
+  document.getElementById('se-apply-btn').disabled=false;
 }
 async function saveSub(){
   var body={offset:Number.parseFloat(document.getElementById('sub-level').value)};
@@ -134,7 +253,13 @@ async function saveSub(){
   try{var r=await fetch('/api/audio/sub',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
     var d=await r.json();
     if(d.success){submsg('Saved','ok');
-      if(hasXo){hiddenBands=body.crossover>=40?XOVER_BANDS:0;applyXoverMask();}}
+      if(hasXo){
+        /* The firmware re-spaces the bands and flattens them. */
+        seFreqs={low:d.freqs_low||seFreqs.low,high:d.freqs_high||seFreqs.high};
+        seGains={sat:new Array(seBands).fill(0),sub:new Array(seBands).fill(0)};
+        document.getElementById('se-apply-btn').disabled=true;
+        seApplyMode(body.crossover>=40);
+      }}
     else{submsg(d.error||'Failed','err');}}
   catch(e){submsg('Error saving sub settings','err');}
 }
@@ -187,5 +312,108 @@ function loadPreset(name){
   gains=PRESETS[name].slice();updateSliders();
   dirty=true;document.getElementById('apply-btn').disabled=false;
 }
-window.onload=function(){buildSliders();loadEQ();loadSub();};
+
+/* ---------- Bi-amp: one crossover plus four 12-band curves ---------- */
+var BA_CURVES=[
+  {key:'l_low',label:'Left Woofer',way:'low'},
+  {key:'l_high',label:'Left Tweeter',way:'high'},
+  {key:'r_low',label:'Right Woofer',way:'low'},
+  {key:'r_high',label:'Right Tweeter',way:'high'}
+];
+var baBands=12;
+var baFreqs={low:[],high:[]};
+var baGains={};
+var baCurve='l_low';
+function baWayOf(key){
+  for(var i=0;i<BA_CURVES.length;i++){
+    if(BA_CURVES[i].key===key)return BA_CURVES[i].way;
+  }
+  return 'low';
+}
+function baRender(){
+  renderTabs('ba-tabs',BA_CURVES,baCurve,function(k){baCurve=k;baRender();});
+  if(!baGains[baCurve]){baGains[baCurve]=new Array(baBands).fill(0);}
+  renderWaySliders('ba-sliders','ba-val-',baFreqs[baWayOf(baCurve)]||[],
+    baGains[baCurve],function(b,g){
+      baGains[baCurve][b]=g;
+      document.getElementById('ba-apply-btn').disabled=false;
+    });
+}
+function bamsg(id,txt,type){
+  var e=document.getElementById(id);
+  e.innerHTML='<div class="msg '+type+'">'+txt+'</div>';
+  setTimeout(function(){e.innerHTML='';},3000);
+}
+async function loadBiamp(){
+  try{var r=await fetch('/api/audio/biamp');if(!r.ok)return;
+    var d=await r.json();
+    if(!d.success||!d.active)return;
+    /* Bi-amp replaces the shared 15-band EQ and the sub controls. */
+    document.getElementById('eq-card').style.display='none';
+    document.getElementById('sub-card').style.display='none';
+    document.getElementById('se-card').style.display='none';
+    document.getElementById('ba-card').style.display='';
+    document.getElementById('ba-eq-card').style.display='';
+    document.getElementById('eq-subtitle').textContent=
+      'Bi-Amp: 2-Way Active Crossover';
+    baBands=d.bands||12;
+    var x=document.getElementById('ba-xo');
+    x.min=d.xo_min;x.max=d.xo_max;x.value=d.crossover;
+    document.getElementById('ba-xo-hz').textContent=
+      Math.round(d.crossover)+' Hz';
+    document.getElementById('ba-swap').value=d.swap?'1':'0';
+    baFreqs={low:d.freqs_low||[],high:d.freqs_high||[]};
+    baGains={};
+    BA_CURVES.forEach(function(c){
+      baGains[c.key]=(d.gains&&d.gains[c.key])||new Array(baBands).fill(0);
+    });
+    baRender();
+    document.getElementById('ba-apply-btn').disabled=true;}
+  catch(e){console.warn('Could not load bi-amp settings',e);}
+}
+async function saveBiamp(){
+  var body={
+    crossover:Number.parseFloat(document.getElementById('ba-xo').value),
+    swap:document.getElementById('ba-swap').value==='1'
+  };
+  try{var r=await fetch('/api/audio/biamp',{method:'POST',
+      headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    var d=await r.json();
+    if(d.success){bamsg('ba-msg','Saved','ok');
+      /* The firmware re-spaces the bands and flattens them. */
+      if(d.freqs_low){baFreqs.low=d.freqs_low;}
+      if(d.freqs_high){baFreqs.high=d.freqs_high;}
+      BA_CURVES.forEach(function(c){
+        baGains[c.key]=new Array(baBands).fill(0);
+      });
+      baRender();
+      document.getElementById('ba-apply-btn').disabled=true;}
+    else{bamsg('ba-msg',d.error||'Failed','err');}}
+  catch(e){bamsg('ba-msg','Error saving crossover','err');}
+}
+async function applyBiampEQ(){
+  document.getElementById('ba-apply-btn').disabled=true;
+  var g={};g[baCurve]=baGains[baCurve];
+  try{var r=await fetch('/api/audio/biamp',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({gains:g})});
+    var d=await r.json();
+    if(d.success){bamsg('ba-eq-msg','EQ applied','ok');}
+    else{bamsg('ba-eq-msg',d.error||'Failed','err');
+      document.getElementById('ba-apply-btn').disabled=false;}}
+  catch(e){bamsg('ba-eq-msg','Error applying EQ','err');
+    document.getElementById('ba-apply-btn').disabled=false;}
+}
+function flatBiampEQ(){
+  baGains[baCurve]=new Array(baBands).fill(0);
+  baRender();
+  document.getElementById('ba-apply-btn').disabled=false;
+}
+window.onload=async function(){
+  buildSliders();loadEQ();
+  /* loadSub() also retitles the header, so let it settle before bi-amp
+     takes the page over. */
+  await loadSub();
+  await loadBiamp();
+};
 </script></body></html>

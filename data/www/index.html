@@ -147,6 +147,11 @@ async function loadChannel(){
     if(d.success){document.getElementById('chan-mode').value=String(d.mode);}}
   catch(e){console.warn('Could not load channel mode',e);}}
 var dualDevices=1;
+var dualMode=0;
+var DUAL_WARN={
+  0:'Switch to 2.1 (Satellites / Sub)?\n\nThe second amplifier is reconfigured as PBTL mono: its OUT_A and OUT_B terminals must be bridged together and wired to a single subwoofer.\n\nRewire before restarting.',
+  1:'Switch to Bi-Amp?\n\nBoth amplifiers run as stereo BTL, with OUT_A driving the woofer and OUT_B the tweeter of one speaker.\n\nIf OUT_A and OUT_B are still bridged for a PBTL subwoofer you MUST unbridge them first — leaving them shorted drives the two outputs against each other and can damage the amplifier and its output filters.'
+};
 /* With two amps the DAC configuration already fixes the routing, so per-output
    channel selection has no meaning. */
 function applyAmpLayout(){
@@ -159,16 +164,25 @@ async function saveChannel(){
   catch(e){msg('chan-msg','Error','err');console.error('saveChannel failed',e);}}
 async function loadDual(){
   try{var r=await fetch('/api/audio/dual');if(!r.ok)return;var d=await r.json();
-    if(d.success&&d.devices>1){dualDevices=d.devices;
-      document.getElementById('dual-mode').value=String(d.mode);
+    if(d.success&&d.devices>1){dualDevices=d.devices;dualMode=d.mode;
+      var sel=document.getElementById('dual-mode');
+      sel.value=String(d.mode);
+      if(!d.biamp){
+        sel.querySelector('option[value="1"]').disabled=true;
+        sel.querySelector('option[value="1"]').textContent='Bi-Amp (unavailable)';
+      }
       document.getElementById('dual-group').style.display='';}}
   catch(e){console.warn('Could not load dual DAC mode',e);}
   applyAmpLayout();}
 async function saveDual(){
-  var v=Number.parseInt(document.getElementById('dual-mode').value,10);
+  var sel=document.getElementById('dual-mode');
+  var v=Number.parseInt(sel.value,10);
+  if(v!==dualMode&&!confirm(DUAL_WARN[v])){sel.value=String(dualMode);return;}
   try{var r=await fetch('/api/audio/dual',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode:v})});
-    var d=await r.json();if(d.success){msg('dual-msg','Saved! Restart to apply.','ok');}else{msg('dual-msg',d.error,'err');}}
-  catch(e){msg('dual-msg','Error','err');console.error('saveDual failed',e);}}
+    var d=await r.json();
+    if(d.success){dualMode=v;msg('dual-msg','Saved! Rewire the speakers, then restart to apply.','ok');}
+    else{sel.value=String(dualMode);msg('dual-msg',d.error,'err');}}
+  catch(e){sel.value=String(dualMode);msg('dual-msg','Error','err');console.error('saveDual failed',e);}}
 async function saveName(){
   var n=document.getElementById('dev-name').value.trim();if(!n){msg('name-msg','Enter a name','err');return;}
   try{var r=await fetch('/api/device/name',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:n})});

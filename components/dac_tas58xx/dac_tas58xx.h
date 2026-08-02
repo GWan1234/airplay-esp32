@@ -31,7 +31,8 @@ float dac_tas58xx_get_sub_offset_db(void);
  * Set the low-pass crossover frequency applied to the PBTL mono sub, so it
  * only reproduces bass rather than the full-range feed. Anything below
  * TAS58XX_XOVER_MIN_HZ disables the filter; higher values are clamped to
- * TAS58XX_XOVER_MAX_HZ.
+ * TAS58XX_XOVER_MAX_HZ. Moving the corner relayouts the per-way EQ bands, so
+ * any stored gains are reset to flat.
  */
 void dac_tas58xx_set_sub_crossover_hz(float hz);
 
@@ -48,6 +49,13 @@ typedef enum {
 } tas58xx_dual_mode_t;
 
 /**
+ * Bi-amp is implemented but has not been validated on hardware, and selecting
+ * it with PBTL sub wiring still attached shorts the two outputs together. Set
+ * to 1 to expose it in the web UI and accept it over the API.
+ */
+#define TAS58XX_BIAMP_SUPPORTED 0
+
+/**
  * Number of TAS58xx chips found on the I2C bus. Returns 0 before dac_init();
  * >1 means the board is a dual-DAC variant.
  */
@@ -62,3 +70,61 @@ tas58xx_dual_mode_t dac_tas58xx_get_dual_mode(void);
  * applied by the next dac_init() — the caller must restart the device.
  */
 void dac_tas58xx_set_dual_mode(tas58xx_dual_mode_t mode);
+
+/* ---------- Per-way EQ (2.1 and bi-amp) ----------
+ *
+ * Whenever a crossover splits the signal, each side gets its own 12-band
+ * EQ whose centre frequencies are spread across that side's passband and
+ * therefore move with the crossover frequency.
+ */
+
+/** Bands in each per-way EQ curve. */
+#define TAS58XX_WAY_BANDS 12
+
+/** The two sides of a crossover. */
+typedef enum {
+  TAS58XX_WAY_LOW = 0,  /**< sub / woofer — low-passed at the crossover */
+  TAS58XX_WAY_HIGH = 1, /**< satellites / tweeter — high-passed */
+} tas58xx_way_t;
+
+/** True when a 2.1 sub crossover is engaged, so the per-way EQ is in use. */
+bool dac_tas58xx_sub_eq_active(void);
+
+/** Centre frequencies of a 2.1 way's EQ bands at the current crossover. */
+void dac_tas58xx_sub_band_freqs(tas58xx_way_t way,
+                                float out[TAS58XX_WAY_BANDS]);
+
+/** 2.1 per-way EQ. Way LOW is the sub, way HIGH the satellites. */
+esp_err_t dac_tas58xx_sub_eq_set_gains(tas58xx_way_t way,
+                                       const float gains_db[TAS58XX_WAY_BANDS]);
+void dac_tas58xx_sub_eq_get_gains(tas58xx_way_t way,
+                                  float gains_db[TAS58XX_WAY_BANDS]);
+
+/* ---------- Bi-amp (two-way active crossover per speaker) ---------- */
+
+#define TAS58XX_BIAMP_XOVER_MIN_HZ 1500.0f
+#define TAS58XX_BIAMP_XOVER_MAX_HZ 4000.0f
+
+/** True when two chips are present and configured as bi-amped speakers. */
+bool dac_tas58xx_biamp_active(void);
+
+/**
+ * Set the woofer/tweeter crossover, clamped to the bi-amp range. Moving it
+ * relayouts the per-way EQ bands, so any stored gains are reset to flat.
+ */
+void dac_tas58xx_set_biamp_crossover_hz(float hz);
+float dac_tas58xx_get_biamp_crossover_hz(void);
+
+/** Select which amplifier output of each chip drives the woofer. */
+void dac_tas58xx_set_biamp_swap(bool low_on_second_output);
+bool dac_tas58xx_get_biamp_swap(void);
+
+/** Centre frequencies of a bi-amp way's EQ bands at the current crossover. */
+void dac_tas58xx_biamp_band_freqs(tas58xx_way_t way,
+                                  float out[TAS58XX_WAY_BANDS]);
+
+/** Per-speaker, per-way EQ. @p dev 0 = left speaker, 1 = right. */
+esp_err_t dac_tas58xx_biamp_set_gains(int dev, tas58xx_way_t way,
+                                      const float gains_db[TAS58XX_WAY_BANDS]);
+void dac_tas58xx_biamp_get_gains(int dev, tas58xx_way_t way,
+                                 float gains_db[TAS58XX_WAY_BANDS]);

@@ -7,6 +7,7 @@
 #include "dac_tas58xx.h"
 #include "dac_tas58xx_eq.h"
 #include "board_utils.h"
+#include "sdkconfig.h"
 #include <math.h>
 #include <string.h>
 #include <sys/param.h>
@@ -265,6 +266,25 @@ static tas58xx_dual_mode_t s_dual_mode = TAS58XX_DUAL_SUB;
 /* Low-pass corner applied to the PBTL sub, 0 = full range. */
 static float s_sub_xover_hz = 0.0f;
 
+/* 2.1 per-way EQ, indexed [tas58xx_way_t][band]: LOW = sub, HIGH = sats. */
+static float s_sub_eq_gain[2][TAS58XX_WAY_BANDS];
+
+/* Bi-amp: woofer/tweeter split point, which output carries the woofer, and
+ * the per-speaker, per-way EQ gains in dB. */
+static float s_biamp_xover_hz = 2500.0f;
+static bool s_biamp_swap = false;
+static float s_biamp_gain[TAS58XX_MAX_DEVICES][2][TAS58XX_WAY_BANDS];
+
+static inline float clamp_eq_gain(float db) {
+  if (db > TAS58XX_EQ_MAX_GAIN_DB) {
+    return TAS58XX_EQ_MAX_GAIN_DB;
+  }
+  if (db < TAS58XX_EQ_MIN_GAIN_DB) {
+    return TAS58XX_EQ_MIN_GAIN_DB;
+  }
+  return db;
+}
+
 /* Sub level trim (dB) added to the master volume for sub devices, and the
  * cached master AirPlay volume so the trim can be re-applied on its own. */
 static float s_sub_offset_db = 0.0f;
@@ -306,6 +326,7 @@ static esp_err_t tas58xx_init_one(tas58xx_dev_t *dev);
 static esp_err_t tas58xx_apply_input_mix(void);
 static esp_err_t tas58xx_apply_sub_crossover(void);
 static esp_err_t tas58xx_apply_satellite_highpass(void);
+static esp_err_t tas58xx_apply_biamp(void);
 
 /* ---------- Detect ---------- */
 
@@ -560,6 +581,69 @@ static void tas58xx_dump_status(const char *context) {
   ESP_LOGD(TAG, "--- end status dump ---");
 }
 
+#if CONFIG_SPKFAULT_GPIO < 0
+/*
+ * Boards without a FAULTZ line to the MCU (e.g. the rev-D dual-DAC brick)
+ * would otherwise never notice an over-current or over-temperature shutdown,
+ * so poll the fault registers instead.
+ */
+#define FAULT_POLL_MS 2000
+/* A clock fault just means I2S has stopped, which is normal between tracks. */
+#define GLOBAL1_CLOCK_FAULT BIT(2)
+
+static TaskHandle_t s_fault_task = NULL;
+static volatile bool s_fault_task_stop = false;
+
+static void tas58xx_fault_task(void *arg) {
+  static uint8_t last[TAS58XX_MAX_DEVICES][3];
+
+  while (1) {
+    vTaskDelay(pdMS_TO_TICKS(FAULT_POLL_MS));
+    if (s_fault_task_stop) {
+      s_fault_task = NULL;
+      vTaskDelete(NULL);
+    }
+
+    REG_LOCK();
+    for (int i = 0; i < s_dev_count; i++) {
+      if (s_devs[i].handle == NULL) {
+        continue;
+      }
+      s_cur = &s_devs[i];
+
+      uint8_t now[3] = {0};
+      tas58xx_read_reg(REG_CHAN_FAULT, &now[0]);
+      tas58xx_read_reg(REG_GLOBAL_FAULT1, &now[1]);
+      tas58xx_read_reg(REG_GLOBAL_FAULT2, &now[2]);
+      now[1] &= (uint8_t)~GLOBAL1_CLOCK_FAULT;
+
+      if (memcmp(now, last[i], sizeof(now)) == 0) {
+        continue;
+      }
+      memcpy(last[i], now, sizeof(now));
+
+      if (now[0] || now[1] || now[2]) {
+        ESP_LOGE(TAG,
+                 "@0x%02X FAULT: CHAN=0x%02X GLOBAL1=0x%02X GLOBAL2=0x%02X",
+                 s_devs[i].addr, now[0], now[1], now[2]);
+        if (now[0] & 0x03) {
+          ESP_LOGE(TAG,
+                   "@0x%02X over-current - check the speaker wiring matches "
+                   "the DAC configuration (PBTL outputs must not stay bridged "
+                   "in bi-amp mode)",
+                   s_devs[i].addr);
+        }
+        tas58xx_dump_status("fault");
+      } else {
+        ESP_LOGW(TAG, "@0x%02X faults cleared", s_devs[i].addr);
+      }
+    }
+    s_cur = NULL;
+    REG_UNLOCK();
+  }
+}
+#endif /* CONFIG_SPKFAULT_GPIO < 0 */
+
 /*
  * Initialize a single TAS58xx chip: add it to the I2C bus, verify its die
  * ID, run the model-specific register init sequence, and (for the sub)
@@ -709,11 +793,25 @@ static esp_err_t tas58xx_init(void *i2c_bus) {
   }
   REG_UNLOCK();
 
+#if CONFIG_SPKFAULT_GPIO < 0
+  s_fault_task_stop = false;
+  if (s_fault_task == NULL &&
+      xTaskCreate(tas58xx_fault_task, "tas58xx_fault", 3072, NULL, 2,
+                  &s_fault_task) != pdPASS) {
+    ESP_LOGW(TAG, "Failed to start the fault monitor task");
+    s_fault_task = NULL;
+  }
+#endif
+
   return ESP_OK;
 }
 
 static esp_err_t tas58xx_deinit(void) {
   esp_err_t err = ESP_OK;
+
+#if CONFIG_SPKFAULT_GPIO < 0
+  s_fault_task_stop = true;
+#endif
 
   REG_LOCK();
   for (int i = 0; i < s_dev_count; i++) {
@@ -816,7 +914,9 @@ static void set_power_mode_dev(tas58xx_dev_t *dev, dac_power_mode_t mode) {
     if (dev->mix != TAS58XX_MIX_STEREO) {
       tas58xx_apply_input_mix();
     }
-    if (dev->pbtl_mono) {
+    if (dac_tas58xx_biamp_active()) {
+      tas58xx_apply_biamp();
+    } else if (dev->pbtl_mono) {
       tas58xx_apply_sub_crossover();
     } else {
       tas58xx_apply_satellite_highpass();
@@ -1004,6 +1104,12 @@ void dac_tas58xx_set_sub_crossover_hz(float hz) {
     hz = TAS58XX_XOVER_MAX_HZ;
   }
 
+  /* The per-way band centres are derived from the corner, so old gains would
+   * land on different frequencies than the user chose. */
+  if (hz != s_sub_xover_hz) {
+    memset(s_sub_eq_gain, 0, sizeof(s_sub_eq_gain));
+  }
+
   // May be called before the DAC is initialised; the value is picked up when
   // the sub next reaches PLAY.
   if (s_reg_mutex == NULL) {
@@ -1044,6 +1150,80 @@ void dac_tas58xx_set_dual_mode(tas58xx_dual_mode_t mode) {
   s_dual_mode = mode;
   ESP_LOGI(TAG, "Second amplifier role: %s (applied at next init)",
            mode == TAS58XX_DUAL_BIAMP ? "bi-amp L/R" : "PBTL mono sub");
+}
+
+/* Re-program every bi-amped chip from the current settings. */
+static void biamp_reapply(void) {
+  if (s_reg_mutex == NULL || !dac_tas58xx_biamp_active()) {
+    return;
+  }
+  REG_LOCK();
+  for (int i = 0; i < s_dev_count; i++) {
+    s_cur = &s_devs[i];
+    tas58xx_apply_biamp();
+  }
+  s_cur = NULL;
+  REG_UNLOCK();
+}
+
+void dac_tas58xx_set_biamp_crossover_hz(float hz) {
+  if (hz < TAS58XX_BIAMP_XOVER_MIN_HZ) {
+    hz = TAS58XX_BIAMP_XOVER_MIN_HZ;
+  } else if (hz > TAS58XX_BIAMP_XOVER_MAX_HZ) {
+    hz = TAS58XX_BIAMP_XOVER_MAX_HZ;
+  }
+  /* Band centres follow the corner, so previous gains no longer apply. */
+  if (hz != s_biamp_xover_hz) {
+    memset(s_biamp_gain, 0, sizeof(s_biamp_gain));
+  }
+  s_biamp_xover_hz = hz;
+  biamp_reapply();
+}
+
+float dac_tas58xx_get_biamp_crossover_hz(void) {
+  return s_biamp_xover_hz;
+}
+
+void dac_tas58xx_set_biamp_swap(bool low_on_second_output) {
+  s_biamp_swap = low_on_second_output;
+  biamp_reapply();
+}
+
+bool dac_tas58xx_get_biamp_swap(void) {
+  return s_biamp_swap;
+}
+
+esp_err_t dac_tas58xx_biamp_set_gains(int dev, tas58xx_way_t way,
+                                      const float gains_db[TAS58XX_WAY_BANDS]) {
+  if (!gains_db || dev < 0 || dev >= TAS58XX_MAX_DEVICES ||
+      (way != TAS58XX_WAY_LOW && way != TAS58XX_WAY_HIGH)) {
+    return ESP_ERR_INVALID_ARG;
+  }
+
+  for (int i = 0; i < TAS58XX_WAY_BANDS; i++) {
+    s_biamp_gain[dev][way][i] = clamp_eq_gain(gains_db[i]);
+  }
+
+  if (s_reg_mutex == NULL || !dac_tas58xx_biamp_active()) {
+    return ESP_OK;
+  }
+  REG_LOCK();
+  s_cur = &s_devs[dev];
+  esp_err_t err = tas58xx_apply_biamp();
+  s_cur = NULL;
+  REG_UNLOCK();
+  return err;
+}
+
+void dac_tas58xx_biamp_get_gains(int dev, tas58xx_way_t way,
+                                 float gains_db[TAS58XX_WAY_BANDS]) {
+  if (!gains_db || dev < 0 || dev >= TAS58XX_MAX_DEVICES ||
+      (way != TAS58XX_WAY_LOW && way != TAS58XX_WAY_HIGH)) {
+    return;
+  }
+  for (int i = 0; i < TAS58XX_WAY_BANDS; i++) {
+    gains_db[i] = s_biamp_gain[dev][way][i];
+  }
 }
 
 /* ---------- Public ops struct ---------- */
@@ -1492,14 +1672,14 @@ static esp_err_t ensure_custom_coeffs_mode(void) {
 }
 
 /**
- * Program one biquad on both channels using pre-computed 20-byte coefficient
- * blocks from dac_tas58xx_eq_data.h.
+ * Program one biquad using pre-computed 20-byte coefficient blocks from
+ * dac_tas58xx_eq_data.h. Either channel may be NULL to leave it untouched.
  *
  * Enters Book 0xAA, writes CH-L then CH-R, returns to Book 0 / Page 0.
  * Assumes the caller holds REG_LOCK.
  */
-static esp_err_t program_biquad_raw(int bq,
-                                    const uint8_t data[EQ_COEFF_BYTES]) {
+static esp_err_t program_biquad_pair(int bq, const uint8_t *left_data,
+                                     const uint8_t *right_data) {
   esp_err_t err;
 
   if (s_cur->model == TAS58XX_MODEL_TAS5825M) {
@@ -1525,21 +1705,25 @@ static esp_err_t program_biquad_raw(int bq,
                                           : tas5825m_eq_right_addr;
 
   /* Channel 1 (Left) */
-  err =
-      write_biquad_raw(eq_left_addr[bq].page, eq_left_addr[bq].sub_addr, data);
-  if (err != ESP_OK) {
-    ESP_LOGE(TAG, "EQ: CH1 BQ%d raw write failed: %s", bq,
-             esp_err_to_name(err));
-    goto out;
+  if (left_data) {
+    err = write_biquad_raw(eq_left_addr[bq].page, eq_left_addr[bq].sub_addr,
+                           left_data);
+    if (err != ESP_OK) {
+      ESP_LOGE(TAG, "EQ: CH1 BQ%d raw write failed: %s", bq,
+               esp_err_to_name(err));
+      goto out;
+    }
   }
 
   /* Channel 2 (Right) */
-  err = write_biquad_raw(eq_right_addr[bq].page, eq_right_addr[bq].sub_addr,
-                         data);
-  if (err != ESP_OK) {
-    ESP_LOGE(TAG, "EQ: CH2 BQ%d raw write failed: %s", bq,
-             esp_err_to_name(err));
-    goto out;
+  if (right_data) {
+    err = write_biquad_raw(eq_right_addr[bq].page, eq_right_addr[bq].sub_addr,
+                           right_data);
+    if (err != ESP_OK) {
+      ESP_LOGE(TAG, "EQ: CH2 BQ%d raw write failed: %s", bq,
+               esp_err_to_name(err));
+      goto out;
+    }
   }
 
   ESP_LOGD(TAG,
@@ -1550,6 +1734,12 @@ static esp_err_t program_biquad_raw(int bq,
 out:
   select_default_page();
   return err;
+}
+
+/** Program one biquad identically on both channels. */
+static esp_err_t program_biquad_raw(int bq,
+                                    const uint8_t data[EQ_COEFF_BYTES]) {
+  return program_biquad_pair(bq, data, data);
 }
 
 static esp_err_t write_eq_mode(bool enable) {
@@ -1597,11 +1787,22 @@ static esp_err_t write_eq_mode(bool enable) {
   return err;
 }
 
+/* Pack five doubles into the TI coefficient layout {b0, b1, b2, -a1, -a2}
+ * as 5.27 big-endian fixed point. */
+static void pack_biquad(const double coeff[5], uint8_t out[EQ_COEFF_BYTES]) {
+  for (int i = 0; i < 5; i++) {
+    int32_t fixed = (int32_t)llround(coeff[i] * (double)(1 << 27));
+    out[i * 4 + 0] = (uint8_t)(fixed >> 24);
+    out[i * 4 + 1] = (uint8_t)(fixed >> 16);
+    out[i * 4 + 2] = (uint8_t)(fixed >> 8);
+    out[i * 4 + 3] = (uint8_t)fixed;
+  }
+}
+
 /*
- * Design a 2nd-order Butterworth-style low- or high-pass and pack it into the
- * TI coefficient layout {b0, b1, b2, -a1, -a2} as 5.27 big-endian fixed point.
- * Uses double precision because (1 - cos w0) suffers cancellation at the low
- * corner frequencies a subwoofer crossover needs.
+ * Design a 2nd-order Butterworth-style low- or high-pass. Uses double
+ * precision because (1 - cos w0) suffers cancellation at the low corner
+ * frequencies a subwoofer crossover needs.
  */
 static void design_xover_biquad(float fc, float q, bool highpass,
                                 uint8_t out[EQ_COEFF_BYTES]) {
@@ -1619,14 +1820,26 @@ static void design_xover_biquad(float fc, float q, bool highpass,
       2.0 * cosw / a0,    /* -a1 */
       (alpha - 1.0) / a0, /* -a2 */
   };
+  pack_biquad(coeff, out);
+}
 
-  for (int i = 0; i < 5; i++) {
-    int32_t fixed = (int32_t)llround(coeff[i] * (double)(1 << 27));
-    out[i * 4 + 0] = (uint8_t)(fixed >> 24);
-    out[i * 4 + 1] = (uint8_t)(fixed >> 16);
-    out[i * 4 + 2] = (uint8_t)(fixed >> 8);
-    out[i * 4 + 3] = (uint8_t)fixed;
-  }
+/* Design an RBJ peaking filter for the runtime-placed bi-amp EQ bands. */
+static void design_peaking_biquad(float fc, float q, float gain_db,
+                                  uint8_t out[EQ_COEFF_BYTES]) {
+  const double a = pow(10.0, (double)gain_db / 40.0);
+  const double w0 = 2.0 * M_PI * (double)fc / BQ_SAMPLE_RATE_HZ;
+  const double cosw = cos(w0);
+  const double alpha = sin(w0) / (2.0 * (double)q);
+  const double a0 = 1.0 + alpha / a;
+
+  const double coeff[5] = {
+      (1.0 + alpha * a) / a0,  /* b0  */
+      -2.0 * cosw / a0,        /* b1  */
+      (1.0 - alpha * a) / a0,  /* b2  */
+      2.0 * cosw / a0,         /* -a1 */
+      -(1.0 - alpha / a) / a0, /* -a2 */
+  };
+  pack_biquad(coeff, out);
 }
 
 /* True when a PBTL sub is present and band-limited, i.e. the satellites
@@ -1643,12 +1856,64 @@ static bool satellite_highpass_active(void) {
   return false;
 }
 
+/* ---------- Per-way EQ shared by the 2.1 and bi-amp crossovers ---------- */
+
+/* First EQ slot after the two crossover sections. */
+#define WAY_EQ_FIRST_BQ XOVER_BQ_SLOTS
+
+/* Audible range the outer ways are stretched to. */
+#define WAY_BAND_LOW_HZ  20.0
+#define WAY_BAND_HIGH_HZ 20000.0
+
+/*
+ * Spread a way's bands logarithmically across its passband and derive a Q
+ * that makes adjacent bands overlap at their -3 dB points, so a flat set of
+ * gains stays flat.
+ */
+static void way_band_layout(float xover_hz, tas58xx_way_t way,
+                            float freqs[TAS58XX_WAY_BANDS], float *q_out) {
+  const double lo =
+      (way == TAS58XX_WAY_LOW) ? WAY_BAND_LOW_HZ : (double)xover_hz;
+  const double hi =
+      (way == TAS58XX_WAY_LOW) ? (double)xover_hz : WAY_BAND_HIGH_HZ;
+  const double ratio = pow(hi / lo, 1.0 / (double)TAS58XX_WAY_BANDS);
+
+  for (int i = 0; i < TAS58XX_WAY_BANDS; i++) {
+    freqs[i] = (float)(lo * pow(ratio, (double)i + 0.5));
+  }
+  if (q_out) {
+    const double span = ratio; /* 2^octaves, and octaves = log2(ratio) */
+    *q_out = (float)(sqrt(span) / (span - 1.0));
+  }
+}
+
+/*
+ * Fill one biquad slot of a way's chain: the crossover section, one of the
+ * 12 EQ bands, or unity. @p xover_data is already designed for this slot.
+ */
+static const uint8_t *way_slot_coeffs(int bq, const uint8_t *xover_data,
+                                      const float *gains, const float *freqs,
+                                      float q,
+                                      uint8_t scratch[EQ_COEFF_BYTES]) {
+  static const uint8_t unity_bq_bytes[EQ_COEFF_BYTES] = {0x08};
+
+  if (bq < XOVER_BQ_SLOTS) {
+    return xover_data ? xover_data : unity_bq_bytes;
+  }
+  const int band = bq - WAY_EQ_FIRST_BQ;
+  if (band >= TAS58XX_WAY_BANDS || gains[band] == 0.0f) {
+    return unity_bq_bytes;
+  }
+  design_peaking_biquad(freqs[band], q, gains[band], scratch);
+  return scratch;
+}
+
 /*
  * Load the sub low-pass into the current chip's EQ biquad chain. The 15 EQ
  * slots are cascaded, and the user EQ deliberately skips the sub, so slots 0
  * and 1 are free to hold the two Butterworth sections of a 4th-order
- * Linkwitz-Riley (-24 dB/oct). Assumes REG_LOCK is held and the chip is in
- * PLAY.
+ * Linkwitz-Riley (-24 dB/oct) and slots 2..13 the sub's own 12-band EQ.
+ * Assumes REG_LOCK is held and the chip is in PLAY.
  */
 static esp_err_t tas58xx_apply_sub_crossover(void) {
   if (s_cur->model != TAS58XX_MODEL_TAS5825M) {
@@ -1657,23 +1922,29 @@ static esp_err_t tas58xx_apply_sub_crossover(void) {
     return ESP_ERR_NOT_SUPPORTED;
   }
 
-  static const uint8_t unity_bq_bytes[EQ_COEFF_BYTES] = {0x08};
+  const bool active = s_sub_xover_hz > 0.0f;
   uint8_t lpf[EQ_COEFF_BYTES];
-  if (s_sub_xover_hz > 0.0f) {
+  float freqs[TAS58XX_WAY_BANDS];
+  float q = 1.0f;
+  if (active) {
     design_xover_biquad(s_sub_xover_hz, (float)M_SQRT1_2, false, lpf);
+    way_band_layout(s_sub_xover_hz, TAS58XX_WAY_LOW, freqs, &q);
   }
 
   esp_err_t first_err = ESP_OK;
   for (int bq = 0; bq < TAS58XX_EQ_BANDS; bq++) {
+    uint8_t scratch[EQ_COEFF_BYTES];
     const uint8_t *data =
-        (s_sub_xover_hz > 0.0f && bq < XOVER_BQ_SLOTS) ? lpf : unity_bq_bytes;
+        active ? way_slot_coeffs(bq, lpf, s_sub_eq_gain[TAS58XX_WAY_LOW], freqs,
+                                 q, scratch)
+               : way_slot_coeffs(bq, NULL, NULL, NULL, q, scratch);
     esp_err_t err = program_biquad_raw(bq, data);
     if (err != ESP_OK && first_err == ESP_OK) {
       first_err = err;
     }
   }
 
-  if (s_sub_xover_hz > 0.0f) {
+  if (active) {
     ESP_LOGI(TAG, "@0x%02X sub low-pass at %.0f Hz (LR4)", s_cur->addr,
              (double)s_sub_xover_hz);
   } else {
@@ -1684,9 +1955,10 @@ static esp_err_t tas58xx_apply_sub_crossover(void) {
 
 /*
  * Load the complementary high-pass into a satellite chip (s_cur), so it stops
- * duplicating the bass the sub now carries. Borrows the two lowest EQ bands,
- * which sit below the corner and are therefore inaudible on the satellites
- * anyway; when the crossover is off their user gains are restored.
+ * duplicating the bass the sub now carries. While the crossover is engaged the
+ * chip runs the per-way EQ instead of the shared 15-band one: slots 0/1 hold
+ * the high-pass and slots 2..13 the satellites' 12 bands. With the crossover
+ * off the whole chain reverts to the user's 15-band gains.
  * Assumes REG_LOCK is held and the chip is in PLAY.
  */
 static esp_err_t tas58xx_apply_satellite_highpass(void) {
@@ -1695,24 +1967,167 @@ static esp_err_t tas58xx_apply_satellite_highpass(void) {
   }
 
   const bool active = satellite_highpass_active();
-  uint8_t hpf[EQ_COEFF_BYTES];
-  if (active) {
-    design_xover_biquad(s_sub_xover_hz, (float)M_SQRT1_2, true, hpf);
+  esp_err_t first_err = ESP_OK;
+
+  if (!active) {
+    for (int bq = 0; bq < XOVER_BQ_SLOTS; bq++) {
+      esp_err_t err =
+          program_biquad_raw(bq, eq_coeff_table[s_eq_idx[bq]][bq].bytes);
+      if (err != ESP_OK && first_err == ESP_OK) {
+        first_err = err;
+      }
+    }
+    return first_err;
   }
 
-  esp_err_t first_err = ESP_OK;
-  for (int bq = 0; bq < XOVER_BQ_SLOTS; bq++) {
-    const uint8_t *data = active ? hpf : eq_coeff_table[s_eq_idx[bq]][bq].bytes;
+  uint8_t hpf[EQ_COEFF_BYTES];
+  float freqs[TAS58XX_WAY_BANDS];
+  float q;
+  design_xover_biquad(s_sub_xover_hz, (float)M_SQRT1_2, true, hpf);
+  way_band_layout(s_sub_xover_hz, TAS58XX_WAY_HIGH, freqs, &q);
+
+  for (int bq = 0; bq < TAS58XX_EQ_BANDS; bq++) {
+    uint8_t scratch[EQ_COEFF_BYTES];
+    const uint8_t *data = way_slot_coeffs(
+        bq, hpf, s_sub_eq_gain[TAS58XX_WAY_HIGH], freqs, q, scratch);
     esp_err_t err = program_biquad_raw(bq, data);
     if (err != ESP_OK && first_err == ESP_OK) {
       first_err = err;
     }
   }
 
-  if (active) {
-    ESP_LOGI(TAG, "@0x%02X satellite high-pass at %.0f Hz (LR4)", s_cur->addr,
-             (double)s_sub_xover_hz);
+  ESP_LOGI(TAG, "@0x%02X satellite high-pass at %.0f Hz (LR4)", s_cur->addr,
+           (double)s_sub_xover_hz);
+  return first_err;
+}
+
+bool dac_tas58xx_sub_eq_active(void) {
+  return satellite_highpass_active();
+}
+
+/* True when a crossover has taken over the 15 cascaded biquads, so the
+ * shared 15-band EQ must keep its hands off them. */
+static bool crossover_owns_eq_chain(void) {
+  return satellite_highpass_active() || dac_tas58xx_biamp_active();
+}
+
+void dac_tas58xx_sub_band_freqs(tas58xx_way_t way,
+                                float out[TAS58XX_WAY_BANDS]) {
+  if (out) {
+    way_band_layout(s_sub_xover_hz > 0.0f ? s_sub_xover_hz
+                                          : TAS58XX_XOVER_MIN_HZ,
+                    way, out, NULL);
   }
+}
+
+/* Re-program every chip's crossover chain from the current settings. */
+static void sub_eq_reapply(void) {
+  if (s_reg_mutex == NULL) {
+    return;
+  }
+  REG_LOCK();
+  for (int i = 0; i < s_dev_count; i++) {
+    s_cur = &s_devs[i];
+    if (s_cur->pbtl_mono) {
+      tas58xx_apply_sub_crossover();
+    } else {
+      tas58xx_apply_satellite_highpass();
+    }
+  }
+  s_cur = NULL;
+  REG_UNLOCK();
+}
+
+esp_err_t
+dac_tas58xx_sub_eq_set_gains(tas58xx_way_t way,
+                             const float gains_db[TAS58XX_WAY_BANDS]) {
+  if (!gains_db || (way != TAS58XX_WAY_LOW && way != TAS58XX_WAY_HIGH)) {
+    return ESP_ERR_INVALID_ARG;
+  }
+  for (int i = 0; i < TAS58XX_WAY_BANDS; i++) {
+    s_sub_eq_gain[way][i] = clamp_eq_gain(gains_db[i]);
+  }
+  sub_eq_reapply();
+  return ESP_OK;
+}
+
+void dac_tas58xx_sub_eq_get_gains(tas58xx_way_t way,
+                                  float gains_db[TAS58XX_WAY_BANDS]) {
+  if (!gains_db || (way != TAS58XX_WAY_LOW && way != TAS58XX_WAY_HIGH)) {
+    return;
+  }
+  for (int i = 0; i < TAS58XX_WAY_BANDS; i++) {
+    gains_db[i] = s_sub_eq_gain[way][i];
+  }
+}
+
+/* ---------- Bi-amp: two-way active crossover inside each chip ---------- */
+
+bool dac_tas58xx_biamp_active(void) {
+  return s_dev_count > 1 && s_dual_mode == TAS58XX_DUAL_BIAMP;
+}
+
+void dac_tas58xx_biamp_band_freqs(tas58xx_way_t way,
+                                  float out[TAS58XX_WAY_BANDS]) {
+  if (out) {
+    way_band_layout(s_biamp_xover_hz, way, out, NULL);
+  }
+}
+
+/*
+ * Load the current chip's two output chains as a bi-amped speaker: slots 0/1
+ * carry the LR4 crossover (low-pass on the woofer output, high-pass on the
+ * tweeter), slots 2..13 the 12 EQ bands for that way, and the last slot is
+ * left flat. Assumes REG_LOCK is held and the chip is in PLAY.
+ */
+static esp_err_t tas58xx_apply_biamp(void) {
+  if (s_cur->model != TAS58XX_MODEL_TAS5825M) {
+    ESP_LOGW(TAG, "@0x%02X bi-amp only implemented for TAS5825M", s_cur->addr);
+    return ESP_ERR_NOT_SUPPORTED;
+  }
+
+  const int dev = (int)(s_cur - s_devs);
+  const float *low_gains = s_biamp_gain[dev][TAS58XX_WAY_LOW];
+  const float *high_gains = s_biamp_gain[dev][TAS58XX_WAY_HIGH];
+
+  float low_freq[TAS58XX_WAY_BANDS], high_freq[TAS58XX_WAY_BANDS];
+  float low_q, high_q;
+  way_band_layout(s_biamp_xover_hz, TAS58XX_WAY_LOW, low_freq, &low_q);
+  way_band_layout(s_biamp_xover_hz, TAS58XX_WAY_HIGH, high_freq, &high_q);
+
+  uint8_t lpf[EQ_COEFF_BYTES], hpf[EQ_COEFF_BYTES];
+  design_xover_biquad(s_biamp_xover_hz, (float)M_SQRT1_2, false, lpf);
+  design_xover_biquad(s_biamp_xover_hz, (float)M_SQRT1_2, true, hpf);
+
+  uint8_t saved_ctrl2 = 0;
+  tas58xx_read_reg(REG_DEVICE_CTRL2, &saved_ctrl2);
+  if (!(saved_ctrl2 & CTRL2_MUTE)) {
+    tas58xx_write_reg(REG_DEVICE_CTRL2, saved_ctrl2 | CTRL2_MUTE);
+  }
+
+  esp_err_t first_err = ESP_OK;
+
+  for (int bq = 0; bq < TAS58XX_EQ_BANDS; bq++) {
+    uint8_t low_bytes[EQ_COEFF_BYTES], high_bytes[EQ_COEFF_BYTES];
+    const uint8_t *low =
+        way_slot_coeffs(bq, lpf, low_gains, low_freq, low_q, low_bytes);
+    const uint8_t *high =
+        way_slot_coeffs(bq, hpf, high_gains, high_freq, high_q, high_bytes);
+
+    esp_err_t err = s_biamp_swap ? program_biquad_pair(bq, high, low)
+                                 : program_biquad_pair(bq, low, high);
+    if (err != ESP_OK && first_err == ESP_OK) {
+      first_err = err;
+    }
+  }
+
+  tas58xx_write_reg(REG_DEVICE_CTRL2, saved_ctrl2);
+
+  ESP_LOGI(
+      TAG,
+      "@0x%02X bi-amp %s speaker, crossover %.0f Hz (LR4), woofer on %s output",
+      s_cur->addr, dev == 0 ? "left" : "right", (double)s_biamp_xover_hz,
+      s_biamp_swap ? "second" : "first");
   return first_err;
 }
 
@@ -1807,8 +2222,8 @@ static esp_err_t eq_program_indices_dev(const int idx[TAS58XX_EQ_BANDS]) {
   esp_err_t first_err = ESP_OK;
   for (int i = 0; i < TAS58XX_EQ_BANDS; i++) {
     s_eq_idx[i] = idx[i];
-    if (i < XOVER_BQ_SLOTS && satellite_highpass_active()) {
-      continue; /* slot holds the crossover high-pass */
+    if (crossover_owns_eq_chain()) {
+      continue; /* a crossover is running its own per-way EQ here */
     }
     esp_err_t err = program_biquad_raw(i, eq_coeff_table[idx[i]][i].bytes);
     if (err != ESP_OK && first_err == ESP_OK) {
@@ -1870,9 +2285,9 @@ esp_err_t tas58xx_eq_set_band(int band, float gain_db) {
 
   REG_LOCK();
   s_eq_idx[band] = idx;
-  if (band < XOVER_BQ_SLOTS && satellite_highpass_active()) {
+  if (crossover_owns_eq_chain()) {
     REG_UNLOCK();
-    return ESP_OK; /* slot holds the crossover high-pass */
+    return ESP_OK;
   }
 
   esp_err_t first_err = ESP_OK;
