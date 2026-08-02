@@ -43,8 +43,9 @@
 #define DAC_SUB_OFFSET_MAX_DB    TAS57XX_SUB_OFFSET_MAX_DB
 #define dac_get_sub_offset_db()  dac_tas57xx_get_sub_offset_db()
 #define dac_set_sub_offset_db(x) dac_tas57xx_set_sub_offset_db(x)
-/* The hybrid-flow DSP always provides a sub channel. */
-#define dac_has_sub() true
+/* The trim only moves devices flagged is_sub, which is index > 0, so a
+ * single-amplifier board has nothing for it to act on. */
+#define dac_has_sub() (dac_tas57xx_get_device_count() > 1)
 #elif defined(CONFIG_DAC_TAS58XX)
 #define DAC_HAS_SUB_OFFSET       1
 #define DAC_SUB_OFFSET_MIN_DB    TAS58XX_SUB_OFFSET_MIN_DB

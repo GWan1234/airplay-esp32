@@ -460,6 +460,10 @@ float dac_tas57xx_get_sub_offset_db(void) {
   return s_sub_offset_db;
 }
 
+int dac_tas57xx_get_device_count(void) {
+  return s_dev_count;
+}
+
 const dac_ops_t dac_tas57xx_ops = {
     .init = tas57xx_init,
     .deinit = tas57xx_deinit,

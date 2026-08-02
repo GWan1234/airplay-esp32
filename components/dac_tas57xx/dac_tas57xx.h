@@ -22,3 +22,6 @@ void dac_tas57xx_set_sub_offset_db(float offset_db);
 
 /** Get the current sub volume offset in dB. */
 float dac_tas57xx_get_sub_offset_db(void);
+
+/** Number of TAS57xx amplifiers detected. 0 before dac_init(). */
+int dac_tas57xx_get_device_count(void);
