@@ -164,7 +164,11 @@ function applyAmpLayout(){
 async function saveChannel(){
   var v=Number.parseInt(document.getElementById('chan-mode').value,10);
   try{var r=await fetch('/api/audio/channel',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode:v})});
-    var d=await r.json();if(d.success){msg('chan-msg','Saved!','ok');}else{msg('chan-msg',d.error,'err');}}
+    var d=await r.json();if(d.success){msg('chan-msg','Saved!','ok');
+      /* The firmware may keep stereo regardless of what was asked for. */
+      if(typeof d.mode==='number'){document.getElementById('chan-mode').value=String(d.mode);}
+      chanLocked=!!d.locked;applyAmpLayout();}
+    else{msg('chan-msg',d.error,'err');}}
   catch(e){msg('chan-msg','Error','err');console.error('saveChannel failed',e);}}
 async function loadDual(){
   try{var r=await fetch('/api/audio/dual');if(!r.ok)return;var d=await r.json();
@@ -175,7 +179,8 @@ async function loadDual(){
         sel.querySelector('option[value="1"]').disabled=true;
         sel.querySelector('option[value="1"]').textContent='Bi-Amp (unavailable)';
       }
-      document.getElementById('dual-group').style.display='';}}
+      document.getElementById('dual-group').style.display='';
+      if(d.restart_required){msg('dual-msg','Restart to apply the new wiring.','err');}}}
   catch(e){console.warn('Could not load dual DAC mode',e);}
   applyAmpLayout();}
 async function saveDual(){
@@ -217,7 +222,7 @@ async function loadInfo(){
       document.getElementById('info-chan').textContent=i.wifi_channel||'-';
       document.getElementById('info-phy').textContent=i.wifi_phy||'-';
       document.getElementById('info-bssid').textContent=i.wifi_bssid||'-';
-      if(i.eq_supported){document.getElementById('eq-link').style.display='';}
+      if(i.eq_supported||i.sub_supported){document.getElementById('eq-link').style.display='';}
       document.getElementById('dev-name').placeholder=i.device_name||'';}}catch(e){}}
 window.onload=function(){
   document.getElementById('fw-file').onchange=function(e){var f=e.target.files[0];

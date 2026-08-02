@@ -53,10 +53,11 @@
 #define dac_get_sub_offset_db()  dac_tas58xx_get_sub_offset_db()
 #define dac_set_sub_offset_db(x) dac_tas58xx_set_sub_offset_db(x)
 /* Only dual-DAC boards have a sub, and only while the second amplifier is
- * configured as a bridged mono subwoofer rather than a bi-amp channel. */
+ * configured as a bridged mono subwoofer rather than a bi-amp channel. A role
+ * chosen but not yet restarted into does not count. */
 #define dac_has_sub()                    \
   (dac_tas58xx_get_device_count() > 1 && \
-   dac_tas58xx_get_dual_mode() == TAS58XX_DUAL_SUB)
+   dac_tas58xx_get_active_dual_mode() == TAS58XX_DUAL_SUB)
 #endif
 
 static const char *TAG = "web_server";
@@ -485,6 +486,13 @@ static esp_err_t channel_mode_post_handler(httpd_req_t *req) {
 
 #ifdef DAC_HAS_SUB_OFFSET
 #ifdef CONFIG_DAC_TAS58XX
+/* The NVS blob layout and the driver's band count are declared independently,
+ * so a change to either would silently truncate or overrun the other. */
+_Static_assert(SETTINGS_WAY_BANDS == TAS58XX_WAY_BANDS,
+               "settings/driver per-way band count mismatch");
+_Static_assert(SETTINGS_EQ_BANDS == TAS58XX_EQ_BANDS,
+               "settings/driver EQ band count mismatch");
+
 /* Both crossovers expose their EQ as 12-float curves plus the band centres
  * they currently sit on, which move whenever the crossover moves. */
 static void way_add_array(cJSON *parent, const char *name,
@@ -666,6 +674,9 @@ static esp_err_t dual_mode_get_handler(httpd_req_t *req) {
   cJSON *json = cJSON_CreateObject();
   cJSON_AddNumberToObject(json, "devices", dac_tas58xx_get_device_count());
   cJSON_AddNumberToObject(json, "mode", dac_tas58xx_get_dual_mode());
+  cJSON_AddBoolToObject(json, "restart_required",
+                        dac_tas58xx_get_dual_mode() !=
+                            dac_tas58xx_get_active_dual_mode());
   cJSON_AddBoolToObject(json, "biamp", TAS58XX_BIAMP_SUPPORTED);
   cJSON_AddBoolToObject(json, "success", true);
   char *json_str = cJSON_Print(json);
@@ -950,6 +961,11 @@ static esp_err_t system_info_handler(httpd_req_t *req) {
   cJSON_AddBoolToObject(info, "eq_supported", true);
 #else
   cJSON_AddBoolToObject(info, "eq_supported", false);
+#endif
+#ifdef DAC_HAS_SUB_OFFSET
+  cJSON_AddBoolToObject(info, "sub_supported", dac_has_sub());
+#else
+  cJSON_AddBoolToObject(info, "sub_supported", false);
 #endif
 
   cJSON_AddItemToObject(json, "info", info);

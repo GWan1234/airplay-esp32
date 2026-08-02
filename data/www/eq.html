@@ -203,11 +203,12 @@ function seRender(){
 }
 /* With a crossover engaged the DAC runs a 12-band EQ per way instead of the
    shared 15-band one, so only one of the two cards is ever shown. */
+var eqAvail=true;
 function seApplyMode(active){
-  document.getElementById('eq-card').style.display=active?'none':'';
+  document.getElementById('eq-card').style.display=(active||!eqAvail)?'none':'';
   document.getElementById('se-card').style.display=active?'':'none';
   document.getElementById('eq-subtitle').textContent=
-    active?'':'15-Band Parametric EQ';
+    active?'':(eqAvail?'15-Band Parametric EQ':'');
   if(active){seRender();}
 }
 function seLoad(d){
@@ -230,7 +231,8 @@ async function loadSub(){
       xoLabel(x.value);
       document.getElementById('xo-group').style.display='';}
     document.getElementById('sub-card').style.display='';
-    seLoad(d);}
+    /* Only the TAS58xx reports a per-way crossover EQ. */
+    if(d.bands){seLoad(d);}}
   catch(e){console.warn('Could not load sub settings',e);}
 }
 async function applySubEQ(){
@@ -285,9 +287,13 @@ function submsg(txt,type){
   setTimeout(function(){e.innerHTML='';},3000);
 }
 async function loadEQ(){
-  try{var r=await fetch('/api/eq');var d=await r.json();
+  /* Boards without the shared 15-band EQ (e.g. TAS57xx) do not serve this
+     endpoint at all, so drop the card rather than leave a dead one. */
+  try{var r=await fetch('/api/eq');
+    if(!r.ok){throw new Error('unsupported');}
+    var d=await r.json();
     if(d.success&&d.gains){gains=d.gains;updateSliders();}}
-  catch(e){msg('Failed to load EQ','err');}
+  catch(e){eqAvail=false;seApplyMode(false);}
 }
 async function applyEQ(){
   document.getElementById('apply-btn').disabled=true;
@@ -413,7 +419,8 @@ function flatBiampEQ(){
   document.getElementById('ba-apply-btn').disabled=false;
 }
 window.onload=async function(){
-  buildSliders();loadEQ();
+  buildSliders();
+  await loadEQ();
   /* loadSub() also retitles the header, so let it settle before bi-amp
      takes the page over. */
   await loadSub();

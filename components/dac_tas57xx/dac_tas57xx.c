@@ -520,8 +520,8 @@ static int tas57xx_detect_all(i2c_master_bus_handle_t bus) {
   }
 
   int count = 0;
-  for (size_t i = 0; i < sizeof(tas575x_addrs) && count < TAS57XX_MAX_DEVICES;
-       i++) {
+  const size_t n_addrs = sizeof(tas575x_addrs) / sizeof(tas575x_addrs[0]);
+  for (size_t i = 0; i < n_addrs && count < TAS57XX_MAX_DEVICES; i++) {
     if (i2c_master_probe(bus, tas575x_addrs[i], I2C_TIMEOUT) == ESP_OK) {
       s_devs[count].addr = tas575x_addrs[i];
       s_devs[count].is_sub = (count > 0);

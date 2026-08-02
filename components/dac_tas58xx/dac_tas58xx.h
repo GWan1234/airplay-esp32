@@ -61,8 +61,11 @@ typedef enum {
  */
 int dac_tas58xx_get_device_count(void);
 
-/** Get the configured second-amplifier role. */
+/** Get the configured second-amplifier role, including a pending change. */
 tas58xx_dual_mode_t dac_tas58xx_get_dual_mode(void);
+
+/** Get the role the chips were actually brought up in. */
+tas58xx_dual_mode_t dac_tas58xx_get_active_dual_mode(void);
 
 /**
  * Set the second-amplifier role. PBTL is a control-port setting that can only

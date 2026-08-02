@@ -262,6 +262,10 @@ static i2c_master_bus_handle_t s_bus_handle = NULL;
 
 /* Role of the second amplifier on dual-DAC boards. Read at init only. */
 static tas58xx_dual_mode_t s_dual_mode = TAS58XX_DUAL_SUB;
+/* The role the chips were actually brought up in. PBTL is only writable during
+ * init, so a mode chosen later must not change how the running chips are
+ * driven until the user has rewired and restarted. */
+static tas58xx_dual_mode_t s_active_dual_mode = TAS58XX_DUAL_SUB;
 
 /* Low-pass corner applied to the PBTL sub, 0 = full range. */
 static float s_sub_xover_hz = 0.0f;
@@ -645,6 +649,31 @@ static void tas58xx_fault_task(void *arg) {
 #endif /* CONFIG_SPKFAULT_GPIO < 0 */
 
 /*
+ * Enable the PBTL (mono) output stage for a bridged sub. This is a
+ * control-port setting (DEVICE_CTRL1 bit 2) and must be established while the
+ * device is still in HiZ, before the output stage drives the paralleled load.
+ * Exiting DEEP_SLEEP resets DEVICE_CTRL1, so this has to be re-applied on
+ * every power-on, not just at init. Assumes REG_LOCK is held and s_cur == dev.
+ */
+static esp_err_t tas58xx_apply_pbtl(tas58xx_dev_t *dev) {
+  if (!dev->pbtl_mono) {
+    return ESP_OK;
+  }
+  uint8_t ctrl1 = 0;
+  tas58xx_read_reg(REG_DEVICE_CTRL1, &ctrl1);
+  ctrl1 |= CTRL1_PBTL_EN;
+  esp_err_t err = tas58xx_write_reg(REG_DEVICE_CTRL1, ctrl1);
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG, "@0x%02X failed to enable PBTL: %s", dev->addr,
+             esp_err_to_name(err));
+    return err;
+  }
+  ESP_LOGI(TAG, "@0x%02X PBTL mono mode enabled (DEVICE_CTRL1=0x%02X)",
+           dev->addr, ctrl1);
+  return ESP_OK;
+}
+
+/*
  * Initialize a single TAS58xx chip: add it to the I2C bus, verify its die
  * ID, run the model-specific register init sequence, and (for the sub)
  * enable PBTL mono output. Assumes REG_LOCK is held; sets s_cur to dev.
@@ -705,24 +734,13 @@ static esp_err_t tas58xx_init_one(tas58xx_dev_t *dev) {
   }
 
   /*
-   * Configure the PBTL (mono) output stage while still in HiZ. PBTL is a
-   * control-port setting (DEVICE_CTRL1 bit 2) and must be established
-   * before the output stage drives the paralleled load. The channel
+   * Configure the PBTL (mono) output stage while still in HiZ. The channel
    * routing is a DSP-coefficient change applied once the device reaches
    * PLAY (see tas58xx_apply_input_mix()).
    */
-  if (dev->pbtl_mono) {
-    uint8_t ctrl1 = 0;
-    tas58xx_read_reg(REG_DEVICE_CTRL1, &ctrl1);
-    ctrl1 |= CTRL1_PBTL_EN;
-    err = tas58xx_write_reg(REG_DEVICE_CTRL1, ctrl1);
-    if (err != ESP_OK) {
-      ESP_LOGE(TAG, "@0x%02X failed to enable PBTL: %s", dev->addr,
-               esp_err_to_name(err));
-      return err;
-    }
-    ESP_LOGI(TAG, "@0x%02X PBTL mono mode enabled (DEVICE_CTRL1=0x%02X)",
-             dev->addr, ctrl1);
+  err = tas58xx_apply_pbtl(dev);
+  if (err != ESP_OK) {
+    return err;
   }
 
   // Give the device time to settle
@@ -769,6 +787,7 @@ static esp_err_t tas58xx_init(void *i2c_bus) {
    * each fed from a single input channel.
    */
   if (s_dev_count > 1) {
+    s_active_dual_mode = s_dual_mode;
     if (s_dual_mode == TAS58XX_DUAL_BIAMP) {
       s_devs[0].mix = TAS58XX_MIX_LEFT;
       s_devs[1].mix = TAS58XX_MIX_RIGHT;
@@ -879,6 +898,10 @@ static void set_power_mode_dev(tas58xx_dev_t *dev, dac_power_mode_t mode) {
        * full re-write of signal-path defaults on next EQ update. */
       dev->dsp_defaults_written = false;
     }
+
+    /* DEVICE_CTRL1 is reset by DEEP_SLEEP and the device is in HiZ here, so
+     * re-bridge the outputs before the output stage is allowed to drive. */
+    tas58xx_apply_pbtl(dev);
 
     // Clear any faults accumulated while clocks were absent
     tas58xx_write_reg(REG_FAULT_CLEAR, 0x80);
@@ -1141,6 +1164,10 @@ int dac_tas58xx_get_device_count(void) {
 
 tas58xx_dual_mode_t dac_tas58xx_get_dual_mode(void) {
   return s_dual_mode;
+}
+
+tas58xx_dual_mode_t dac_tas58xx_get_active_dual_mode(void) {
+  return s_active_dual_mode;
 }
 
 void dac_tas58xx_set_dual_mode(tas58xx_dual_mode_t mode) {
@@ -2068,7 +2095,7 @@ void dac_tas58xx_sub_eq_get_gains(tas58xx_way_t way,
 /* ---------- Bi-amp: two-way active crossover inside each chip ---------- */
 
 bool dac_tas58xx_biamp_active(void) {
-  return s_dev_count > 1 && s_dual_mode == TAS58XX_DUAL_BIAMP;
+  return s_dev_count > 1 && s_active_dual_mode == TAS58XX_DUAL_BIAMP;
 }
 
 void dac_tas58xx_biamp_band_freqs(tas58xx_way_t way,
