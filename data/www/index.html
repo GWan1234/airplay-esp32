@@ -144,10 +144,13 @@ async function saveBrightness(){
   catch(e){msg('brightness-msg','Error','err');console.error('saveBrightness failed',e);}}
 async function loadChannel(){
   try{var r=await fetch('/api/audio/channel');var d=await r.json();
-    if(d.success){document.getElementById('chan-mode').value=String(d.mode);}}
-  catch(e){console.warn('Could not load channel mode',e);}}
+    if(d.success){document.getElementById('chan-mode').value=String(d.mode);
+      chanLocked=!!d.locked;}}
+  catch(e){console.warn('Could not load channel mode',e);}
+  applyAmpLayout();}
 var dualDevices=1;
 var dualMode=0;
+var chanLocked=false;
 var DUAL_WARN={
   0:'Switch to 2.1 (Satellites / Sub)?\n\nThe second amplifier is reconfigured as PBTL mono: its OUT_A and OUT_B terminals must be bridged together and wired to a single subwoofer.\n\nRewire before restarting.',
   1:'Switch to Bi-Amp?\n\nBoth amplifiers run as stereo BTL, with OUT_A driving the woofer and OUT_B the tweeter of one speaker.\n\nIf OUT_A and OUT_B are still bridged for a PBTL subwoofer you MUST unbridge them first — leaving them shorted drives the two outputs against each other and can damage the amplifier and its output filters.'
@@ -155,7 +158,8 @@ var DUAL_WARN={
 /* With two amps the DAC configuration already fixes the routing, so per-output
    channel selection has no meaning. */
 function applyAmpLayout(){
-  document.getElementById('chan-group').style.display=dualDevices>1?'none':'';
+  document.getElementById('chan-group').style.display=
+    (chanLocked||dualDevices>1)?'none':'';
 }
 async function saveChannel(){
   var v=Number.parseInt(document.getElementById('chan-mode').value,10);

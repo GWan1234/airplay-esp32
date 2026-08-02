@@ -259,13 +259,9 @@ async function saveSub(){
   try{var r=await fetch('/api/audio/sub',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
     var d=await r.json();
     if(d.success){submsg('Saved','ok');
-      if(hasXo){
-        /* The firmware re-spaces the bands and flattens them. */
-        seFreqs={low:d.freqs_low||seFreqs.low,high:d.freqs_high||seFreqs.high};
-        seGains={sat:new Array(seBands).fill(0),sub:new Array(seBands).fill(0)};
-        document.getElementById('se-apply-btn').disabled=true;
-        seApplyMode(body.crossover>=seXoMin);
-      }}
+      /* The firmware only re-spaces and flattens the bands when the corner
+         actually moves, so redraw from what it reports. */
+      if(hasXo){seLoad(Object.assign({bands:seBands},d));}}
     else{submsg(d.error||'Failed','err');}}
   catch(e){submsg('Error saving sub settings','err');}
 }
@@ -386,11 +382,12 @@ async function saveBiamp(){
       headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
     var d=await r.json();
     if(d.success){bamsg('ba-msg','Saved','ok');
-      /* The firmware re-spaces the bands and flattens them. */
+      /* The firmware only re-spaces and flattens the bands when the corner
+         actually moves, so redraw from what it reports. */
       if(d.freqs_low){baFreqs.low=d.freqs_low;}
       if(d.freqs_high){baFreqs.high=d.freqs_high;}
       BA_CURVES.forEach(function(c){
-        baGains[c.key]=new Array(baBands).fill(0);
+        if(d.gains&&d.gains[c.key]){baGains[c.key]=d.gains[c.key];}
       });
       baRender();
       document.getElementById('ba-apply-btn').disabled=true;}

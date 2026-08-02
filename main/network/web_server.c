@@ -436,6 +436,7 @@ static bool json_int_in_range(const cJSON *v, int lo, int hi) {
 static esp_err_t channel_mode_get_handler(httpd_req_t *req) {
   cJSON *json = cJSON_CreateObject();
   cJSON_AddNumberToObject(json, "mode", audio_output_get_channel_mode());
+  cJSON_AddBoolToObject(json, "locked", audio_output_channel_mode_locked());
   cJSON_AddBoolToObject(json, "success", true);
   char *json_str = cJSON_Print(json);
   httpd_resp_set_type(req, "application/json");
@@ -466,6 +467,8 @@ static esp_err_t channel_mode_post_handler(httpd_req_t *req) {
     cJSON_AddBoolToObject(response, "success", true);
     /* Boards with two amplifiers keep stereo whatever was asked for. */
     cJSON_AddNumberToObject(response, "mode", audio_output_get_channel_mode());
+    cJSON_AddBoolToObject(response, "locked",
+                          audio_output_channel_mode_locked());
   } else {
     cJSON_AddBoolToObject(response, "success", false);
     cJSON_AddStringToObject(response, "error", "Expected {\"mode\": 0-3}");
@@ -520,6 +523,21 @@ static void sub_eq_add_freqs(cJSON *parent) {
   way_add_array(parent, "freqs_high", f, true);
 }
 
+/* The driver only relayouts and flattens the bands when the corner actually
+ * moves, so hand the resulting state back rather than let the client guess. */
+static void sub_eq_add_state(cJSON *parent) {
+  cJSON_AddBoolToObject(parent, "eq_active", dac_tas58xx_sub_eq_active());
+  sub_eq_add_freqs(parent);
+
+  cJSON *gains = cJSON_CreateObject();
+  float curve[TAS58XX_WAY_BANDS];
+  dac_tas58xx_sub_eq_get_gains(TAS58XX_WAY_LOW, curve);
+  way_add_array(gains, "sub", curve, false);
+  dac_tas58xx_sub_eq_get_gains(TAS58XX_WAY_HIGH, curve);
+  way_add_array(gains, "sat", curve, false);
+  cJSON_AddItemToObject(parent, "gains", gains);
+}
+
 static esp_err_t sub_eq_persist(void) {
   float saved[2][SETTINGS_WAY_BANDS];
   dac_tas58xx_sub_eq_get_gains(TAS58XX_WAY_LOW, saved[0]);
@@ -539,19 +557,10 @@ static esp_err_t sub_offset_get_handler(httpd_req_t *req) {
                           dac_tas58xx_get_sub_crossover_hz());
   cJSON_AddNumberToObject(json, "xo_min", TAS58XX_XOVER_MIN_HZ);
   cJSON_AddNumberToObject(json, "xo_max", TAS58XX_XOVER_MAX_HZ);
-  cJSON_AddBoolToObject(json, "eq_active", dac_tas58xx_sub_eq_active());
   cJSON_AddNumberToObject(json, "bands", TAS58XX_WAY_BANDS);
   cJSON_AddNumberToObject(json, "min_db", TAS58XX_EQ_MIN_GAIN_DB);
   cJSON_AddNumberToObject(json, "max_db", TAS58XX_EQ_MAX_GAIN_DB);
-  sub_eq_add_freqs(json);
-
-  cJSON *gains = cJSON_CreateObject();
-  float curve[TAS58XX_WAY_BANDS];
-  dac_tas58xx_sub_eq_get_gains(TAS58XX_WAY_LOW, curve);
-  way_add_array(gains, "sub", curve, false);
-  dac_tas58xx_sub_eq_get_gains(TAS58XX_WAY_HIGH, curve);
-  way_add_array(gains, "sat", curve, false);
-  cJSON_AddItemToObject(json, "gains", gains);
+  sub_eq_add_state(json);
 #endif
   cJSON_AddBoolToObject(json, "success", true);
   char *json_str = cJSON_Print(json);
@@ -633,7 +642,7 @@ static esp_err_t sub_offset_post_handler(httpd_req_t *req) {
   } else if (handled) {
     cJSON_AddBoolToObject(response, "success", true);
 #ifdef CONFIG_DAC_TAS58XX
-    sub_eq_add_freqs(response);
+    sub_eq_add_state(response);
 #endif
   } else {
     cJSON_AddBoolToObject(response, "success", false);
@@ -723,6 +732,19 @@ static void biamp_add_freqs(cJSON *parent) {
   way_add_array(parent, "freqs_high", f, true);
 }
 
+/* The driver only relayouts and flattens the bands when the corner actually
+ * moves, so hand the resulting state back rather than let the client guess. */
+static void biamp_add_state(cJSON *parent) {
+  biamp_add_freqs(parent);
+
+  cJSON *gains = cJSON_CreateObject();
+  biamp_add_gain_array(gains, "l_low", 0, TAS58XX_WAY_LOW);
+  biamp_add_gain_array(gains, "l_high", 0, TAS58XX_WAY_HIGH);
+  biamp_add_gain_array(gains, "r_low", 1, TAS58XX_WAY_LOW);
+  biamp_add_gain_array(gains, "r_high", 1, TAS58XX_WAY_HIGH);
+  cJSON_AddItemToObject(parent, "gains", gains);
+}
+
 static esp_err_t biamp_get_handler(httpd_req_t *req) {
   cJSON *json = cJSON_CreateObject();
   cJSON_AddBoolToObject(json, "active", dac_tas58xx_biamp_active());
@@ -734,14 +756,7 @@ static esp_err_t biamp_get_handler(httpd_req_t *req) {
   cJSON_AddNumberToObject(json, "bands", TAS58XX_WAY_BANDS);
   cJSON_AddNumberToObject(json, "min_db", TAS58XX_EQ_MIN_GAIN_DB);
   cJSON_AddNumberToObject(json, "max_db", TAS58XX_EQ_MAX_GAIN_DB);
-  biamp_add_freqs(json);
-
-  cJSON *gains = cJSON_CreateObject();
-  biamp_add_gain_array(gains, "l_low", 0, TAS58XX_WAY_LOW);
-  biamp_add_gain_array(gains, "l_high", 0, TAS58XX_WAY_HIGH);
-  biamp_add_gain_array(gains, "r_low", 1, TAS58XX_WAY_LOW);
-  biamp_add_gain_array(gains, "r_high", 1, TAS58XX_WAY_HIGH);
-  cJSON_AddItemToObject(json, "gains", gains);
+  biamp_add_state(json);
 
   cJSON_AddBoolToObject(json, "success", true);
   char *json_str = cJSON_Print(json);
@@ -827,7 +842,7 @@ static esp_err_t biamp_post_handler(httpd_req_t *req) {
   } else if (handled) {
     cJSON_AddBoolToObject(response, "success", true);
     /* Band centres track the crossover, so hand the new layout back. */
-    biamp_add_freqs(response);
+    biamp_add_state(response);
   } else {
     cJSON_AddBoolToObject(response, "success", false);
     cJSON_AddStringToObject(

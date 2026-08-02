@@ -89,3 +89,9 @@ void audio_output_set_channel_mode(audio_channel_mode_t mode);
  * Get the current output channel mode.
  */
 audio_channel_mode_t audio_output_get_channel_mode(void);
+
+/**
+ * True when the DAC configuration already fixes the per-output routing, in
+ * which case the mode is forced to STEREO and set/cycle are ignored.
+ */
+bool audio_output_channel_mode_locked(void);
