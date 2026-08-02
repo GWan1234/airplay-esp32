@@ -38,6 +38,7 @@ idf.py -p /dev/ttyUSB0 monitor
 | `esparagus-audio-brick` | ESP32 + TAS5825M DAC/amp | |
 | `esparagus-audio-brick-bt` | Same + Bluetooth + Ethernet | |
 | `esparagus-audio-brick-s3` | ESP32-S3 + TAS5825M | |
+| `esparagus-audio-brick-dual-dac` | ESP32-S3 + 2x TAS5825M (rev D) | Stereo @0x4C + PBTL mono sub @0x4D |
 | `esparagus-louder` | ESP32 + TAS5825M + extra gain | |
 | `esparagus-louder-bt` | Louder + Bluetooth | |
 | `esparagus-louder-s3` | ESP32-S3 + Louder | |

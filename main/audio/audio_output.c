@@ -13,6 +13,9 @@
 #include "audio_receiver.h"
 #include <inttypes.h>
 #include <stdlib.h>
+#ifdef CONFIG_DAC_TAS58XX
+#include "dac_tas58xx.h"
+#endif
 
 // SIDE NOTE; providing power from GPIO pins is capped ~20mA.
 #if CONFIG_I2S_GND_IO >= 0
@@ -54,6 +57,8 @@ static TaskHandle_t playback_task_handle = NULL;
 static volatile int source_rate = 44100;
 static volatile bool resample_reinit_needed = false;
 static volatile audio_channel_mode_t channel_mode = AUDIO_CHANNEL_STEREO;
+
+static bool channel_mode_locked(void);
 
 static void apply_volume(int16_t *buf, size_t n) {
 #ifndef CONFIG_DAC_CONTROLS_VOLUME
@@ -173,6 +178,11 @@ esp_err_t audio_output_init(void) {
       saved_mode <= AUDIO_CHANNEL_MONO) {
     channel_mode = (audio_channel_mode_t)saved_mode;
     ESP_LOGI(TAG, "Loaded channel mode: %d", saved_mode);
+  }
+
+  if (channel_mode != AUDIO_CHANNEL_STEREO && channel_mode_locked()) {
+    ESP_LOGI(TAG, "Dual DAC output: resetting channel mode to stereo");
+    audio_output_set_channel_mode(AUDIO_CHANNEL_STEREO);
   }
 
   i2s_chan_config_t chan_cfg =
@@ -305,7 +315,20 @@ uint32_t audio_output_get_hardware_latency_us(void) {
                     OUTPUT_RATE);
 }
 
+/* With two amplifiers the DAC configuration already fixes the routing, so a
+ * channel selection on top of that would only mute a speaker. */
+static bool channel_mode_locked(void) {
+#ifdef CONFIG_DAC_TAS58XX
+  return dac_tas58xx_get_device_count() > 1;
+#else
+  return false;
+#endif
+}
+
 audio_channel_mode_t audio_output_cycle_channel_mode(void) {
+  if (channel_mode_locked()) {
+    return channel_mode;
+  }
   audio_channel_mode_t next;
   switch (channel_mode) {
   case AUDIO_CHANNEL_STEREO:
@@ -326,7 +349,7 @@ audio_channel_mode_t audio_output_cycle_channel_mode(void) {
 }
 
 void audio_output_set_channel_mode(audio_channel_mode_t mode) {
-  if (mode > AUDIO_CHANNEL_MONO) {
+  if (mode > AUDIO_CHANNEL_MONO || channel_mode_locked()) {
     mode = AUDIO_CHANNEL_STEREO;
   }
   channel_mode = mode;

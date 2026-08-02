@@ -16,6 +16,7 @@
 #include "esp_eth_netif_glue.h"
 #include "esp_eth_phy.h"
 #include "esp_mac.h"
+#include "board_utils.h"
 #include "iot_board.h"
 
 #include <string.h>
@@ -128,6 +129,10 @@ esp_err_t ethernet_init(void) {
   w5500_config.int_gpio_num = BOARD_ETH_INT_GPIO;
 #if BOARD_ETH_INT_GPIO < 0
   w5500_config.poll_period_ms = 10;
+#else
+  // The W5500 driver registers its own per-pin handler, so the shared ISR
+  // service must already exist (boards without a fault pin don't install it).
+  board_gpio_isr_init();
 #endif
 
   // Create MAC instance

@@ -227,6 +227,15 @@ void app_main(void) {
   if (settings_get_sub_offset(&sub_off) == ESP_OK) {
     dac_tas58xx_set_sub_offset_db(sub_off);
   }
+  float sub_xo;
+  if (settings_get_sub_crossover(&sub_xo) == ESP_OK) {
+    dac_tas58xx_set_sub_crossover_hz(sub_xo);
+  }
+  // Second-amplifier role must be known before the DAC is initialised.
+  uint8_t dual_mode;
+  if (settings_get_dual_mode(&dual_mode) == ESP_OK) {
+    dac_tas58xx_set_dual_mode((tas58xx_dual_mode_t)dual_mode);
+  }
 #endif
   spiffs_storage_init();
   log_stream_init();

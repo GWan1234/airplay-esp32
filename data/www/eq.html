@@ -38,9 +38,15 @@ body{font-family:-apple-system,system-ui,sans-serif;background:linear-gradient(1
 .msg.ok{background:rgba(27,67,50,0.5)}
 .msg.err{background:rgba(92,26,26,0.5)}
 .msg.info{background:rgba(15,52,96,0.5)}
+.form-group{margin-bottom:14px}
+.form-group label{display:block;font-size:12px;color:#888;margin-bottom:6px}
+.slider-row{display:flex;align-items:center;gap:12px}
+.slider-row input[type=range]{flex:1;accent-color:#e94560}
+.slider-row span{font-size:13px;color:#888;min-width:60px;text-align:right}
+.hint{color:#888;font-size:12px;margin-top:6px}
 </style></head><body>
 <div class='wrap'>
-<div class='header'><h1>Equalizer</h1><p>15-Band Parametric EQ</p></div>
+<div class='header'><h1>Equalizer</h1><p id='eq-subtitle'>15-Band Parametric EQ</p></div>
 <div class='nav'><a href='/'>&#8592; Back to Settings</a></div>
 <div class='card'><h2>EQ Bands</h2>
 <div style='display:flex'>
@@ -61,11 +67,25 @@ body{font-family:-apple-system,system-ui,sans-serif;background:linear-gradient(1
 </select></div>
 </div>
 <div id='eq-msg'></div>
+</div>
+<div class='card' id='sub-card' style='display:none'><h2>Subwoofer</h2>
+<div class='form-group'><label for='sub-level'>Sub Level</label>
+<div class='slider-row'><input type='range' id='sub-level' min='-15' max='15' step='1' value='0' oninput='document.getElementById("sub-db").textContent=(this.value>0?"+":"")+this.value+" dB"'>
+<span id='sub-db'>0 dB</span></div></div>
+<div class='form-group' id='xo-group' style='display:none'><label for='sub-xo'>Crossover</label>
+<div class='slider-row'><input type='range' id='sub-xo' min='0' max='400' step='10' value='0' oninput='document.getElementById("xo-hz").textContent=this.value<40?"Off":this.value+" Hz"'>
+<span id='xo-hz'>Off</span></div>
+<p class='hint'>Linkwitz-Riley 24 dB/oct. The sub is low-passed and the speakers are high-passed at this frequency.</p></div>
+<button class='btn btn-secondary' onclick='saveSub()'>Save Sub Settings</button>
+<div id='sub-msg'></div>
 </div></div>
 <script>
 var BANDS=15;
+/* Bands the DAC borrows for the crossover filter when a sub is band-limited. */
+var XOVER_BANDS=2;
 var FREQS=[20,31.5,50,80,125,200,315,500,800,'1.25k','2k','3.15k','5k','8k','16k'];
 var gains=new Array(BANDS).fill(0);
+var hiddenBands=0;
 var dirty=false;
 function fmtFreq(f){return typeof f==='number'?f+'':f;}
 function fmtGain(v){return (v>0?'+':'')+v;}
@@ -83,6 +103,40 @@ function buildSliders(){
     var f=document.createElement('div');f.className='freq';f.textContent=fmtFreq(FREQS[i]);
     d.appendChild(v);d.appendChild(s);d.appendChild(f);c.appendChild(d);
   }
+  applyXoverMask();
+}
+function applyXoverMask(){
+  var bands=document.querySelectorAll('.eq-band');
+  for(var i=0;i<bands.length;i++){
+    bands[i].style.display=i<hiddenBands?'none':'';
+  }
+  document.getElementById('eq-subtitle').textContent=
+    (BANDS-hiddenBands)+'-Band Parametric EQ';
+}
+async function loadSub(){
+  try{var r=await fetch('/api/audio/sub');if(!r.ok)return;var d=await r.json();
+    if(!d.success||d.available===false)return;
+    var s=document.getElementById('sub-level');s.min=d.min;s.max=d.max;s.value=d.offset;
+    document.getElementById('sub-db').textContent=(d.offset>0?'+':'')+d.offset+' dB';
+    if(d.xo_max){var x=document.getElementById('sub-xo');x.max=d.xo_max;x.value=d.crossover||0;
+      document.getElementById('xo-hz').textContent=x.value<40?'Off':x.value+' Hz';
+      document.getElementById('xo-group').style.display='';
+      hiddenBands=d.crossover>0?XOVER_BANDS:0;}
+    document.getElementById('sub-card').style.display='';}
+  catch(e){console.warn('Could not load sub settings',e);}
+  applyXoverMask();
+}
+async function saveSub(){
+  var body={offset:Number.parseFloat(document.getElementById('sub-level').value)};
+  var xo=document.getElementById('sub-xo');
+  var hasXo=document.getElementById('xo-group').style.display!=='none';
+  if(hasXo){body.crossover=Number.parseFloat(xo.value);}
+  try{var r=await fetch('/api/audio/sub',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    var d=await r.json();
+    if(d.success){submsg('Saved','ok');
+      if(hasXo){hiddenBands=body.crossover>=40?XOVER_BANDS:0;applyXoverMask();}}
+    else{submsg(d.error||'Failed','err');}}
+  catch(e){submsg('Error saving sub settings','err');}
 }
 function updateSliders(){
   for(var i=0;i<BANDS;i++){
@@ -95,6 +149,11 @@ function updateSliders(){
 }
 function msg(txt,type){
   var e=document.getElementById('eq-msg');
+  e.innerHTML='<div class="msg '+type+'">'+txt+'</div>';
+  setTimeout(function(){e.innerHTML='';},3000);
+}
+function submsg(txt,type){
+  var e=document.getElementById('sub-msg');
   e.innerHTML='<div class="msg '+type+'">'+txt+'</div>';
   setTimeout(function(){e.innerHTML='';},3000);
 }
@@ -128,5 +187,5 @@ function loadPreset(name){
   gains=PRESETS[name].slice();updateSliders();
   dirty=true;document.getElementById('apply-btn').disabled=false;
 }
-window.onload=function(){buildSliders();loadEQ();};
+window.onload=function(){buildSliders();loadEQ();loadSub();};
 </script></body></html>

@@ -43,12 +43,19 @@
 #define DAC_SUB_OFFSET_MAX_DB    TAS57XX_SUB_OFFSET_MAX_DB
 #define dac_get_sub_offset_db()  dac_tas57xx_get_sub_offset_db()
 #define dac_set_sub_offset_db(x) dac_tas57xx_set_sub_offset_db(x)
+/* The hybrid-flow DSP always provides a sub channel. */
+#define dac_has_sub() true
 #elif defined(CONFIG_DAC_TAS58XX)
 #define DAC_HAS_SUB_OFFSET       1
 #define DAC_SUB_OFFSET_MIN_DB    TAS58XX_SUB_OFFSET_MIN_DB
 #define DAC_SUB_OFFSET_MAX_DB    TAS58XX_SUB_OFFSET_MAX_DB
 #define dac_get_sub_offset_db()  dac_tas58xx_get_sub_offset_db()
 #define dac_set_sub_offset_db(x) dac_tas58xx_set_sub_offset_db(x)
+/* Only dual-DAC boards have a sub, and only while the second amplifier is
+ * configured as a bridged mono subwoofer rather than a bi-amp channel. */
+#define dac_has_sub()                    \
+  (dac_tas58xx_get_device_count() > 1 && \
+   dac_tas58xx_get_dual_mode() == TAS58XX_DUAL_SUB)
 #endif
 
 static const char *TAG = "web_server";
@@ -448,6 +455,13 @@ static esp_err_t sub_offset_get_handler(httpd_req_t *req) {
   cJSON_AddNumberToObject(json, "offset", dac_get_sub_offset_db());
   cJSON_AddNumberToObject(json, "min", DAC_SUB_OFFSET_MIN_DB);
   cJSON_AddNumberToObject(json, "max", DAC_SUB_OFFSET_MAX_DB);
+  cJSON_AddBoolToObject(json, "available", dac_has_sub());
+#ifdef CONFIG_DAC_TAS58XX
+  cJSON_AddNumberToObject(json, "crossover",
+                          dac_tas58xx_get_sub_crossover_hz());
+  cJSON_AddNumberToObject(json, "xo_min", TAS58XX_XOVER_MIN_HZ);
+  cJSON_AddNumberToObject(json, "xo_max", TAS58XX_XOVER_MAX_HZ);
+#endif
   cJSON_AddBoolToObject(json, "success", true);
   char *json_str = cJSON_Print(json);
   httpd_resp_set_type(req, "application/json");
@@ -473,6 +487,8 @@ static esp_err_t sub_offset_post_handler(httpd_req_t *req) {
   }
 
   cJSON *response = cJSON_CreateObject();
+  bool handled = false;
+
   cJSON *val = cJSON_GetObjectItem(json, "offset");
   if (val && cJSON_IsNumber(val)) {
     float off = (float)val->valuedouble;
@@ -484,10 +500,25 @@ static esp_err_t sub_offset_post_handler(httpd_req_t *req) {
     }
     dac_set_sub_offset_db(off);
     settings_set_sub_offset(off);
+    handled = true;
+  }
+
+#ifdef CONFIG_DAC_TAS58XX
+  cJSON *xo = cJSON_GetObjectItem(json, "crossover");
+  if (xo && cJSON_IsNumber(xo)) {
+    float hz = (float)xo->valuedouble;
+    dac_tas58xx_set_sub_crossover_hz(hz);
+    settings_set_sub_crossover(dac_tas58xx_get_sub_crossover_hz());
+    handled = true;
+  }
+#endif
+
+  if (handled) {
     cJSON_AddBoolToObject(response, "success", true);
   } else {
     cJSON_AddBoolToObject(response, "success", false);
-    cJSON_AddStringToObject(response, "error", "Expected {\"offset\": dB}");
+    cJSON_AddStringToObject(response, "error",
+                            "Expected {\"offset\": dB} or {\"crossover\": Hz}");
   }
 
   char *json_str = cJSON_Print(response);
@@ -499,6 +530,61 @@ static esp_err_t sub_offset_post_handler(httpd_req_t *req) {
   return ESP_OK;
 }
 #endif /* DAC_HAS_SUB_OFFSET */
+
+#ifdef CONFIG_DAC_TAS58XX
+/* Second-amplifier role on dual-DAC boards: bridged mono sub or bi-amp. */
+static esp_err_t dual_mode_get_handler(httpd_req_t *req) {
+  cJSON *json = cJSON_CreateObject();
+  cJSON_AddNumberToObject(json, "devices", dac_tas58xx_get_device_count());
+  cJSON_AddNumberToObject(json, "mode", dac_tas58xx_get_dual_mode());
+  cJSON_AddBoolToObject(json, "success", true);
+  char *json_str = cJSON_Print(json);
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_send(req, json_str, HTTPD_RESP_USE_STRLEN);
+  free(json_str);
+  cJSON_Delete(json);
+  return ESP_OK;
+}
+
+static esp_err_t dual_mode_post_handler(httpd_req_t *req) {
+  char content[64];
+  int ret = httpd_req_recv(req, content, sizeof(content) - 1);
+  if (ret <= 0) {
+    httpd_resp_send_500(req);
+    return ESP_FAIL;
+  }
+  content[ret] = '\0';
+
+  cJSON *json = cJSON_Parse(content);
+  if (!json) {
+    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON");
+    return ESP_FAIL;
+  }
+
+  cJSON *response = cJSON_CreateObject();
+  cJSON *val = cJSON_GetObjectItem(json, "mode");
+  if (val && cJSON_IsNumber(val) && val->valueint >= TAS58XX_DUAL_SUB &&
+      val->valueint <= TAS58XX_DUAL_BIAMP) {
+    dac_tas58xx_set_dual_mode((tas58xx_dual_mode_t)val->valueint);
+    settings_set_dual_mode((uint8_t)val->valueint);
+    cJSON_AddBoolToObject(response, "success", true);
+    /* PBTL is a control-port setting that can only be changed while the
+     * output stage is idle, so the change lands on the next boot. */
+    cJSON_AddBoolToObject(response, "restart_required", true);
+  } else {
+    cJSON_AddBoolToObject(response, "success", false);
+    cJSON_AddStringToObject(response, "error", "Expected {\"mode\": 0-1}");
+  }
+
+  char *json_str = cJSON_Print(response);
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_send(req, json_str, HTTPD_RESP_USE_STRLEN);
+  free(json_str);
+  cJSON_Delete(json);
+  cJSON_Delete(response);
+  return ESP_OK;
+}
+#endif /* CONFIG_DAC_TAS58XX */
 
 static esp_err_t ota_update_handler(httpd_req_t *req) {
   if (req->content_len == 0) {
@@ -895,8 +981,11 @@ esp_err_t web_server_start(uint16_t port) {
   config.lru_purge_enable = true; // Reclaim stale sockets when all are in use
   config.max_uri_handlers =
       30; // Room for captive portal + EQ + speedtest + brightness + channel
-#ifdef CONFIG_DAC_TAS57XX
+#ifdef DAC_HAS_SUB_OFFSET
   config.max_uri_handlers += 2; // sub level get/post
+#endif
+#ifdef CONFIG_DAC_TAS58XX
+  config.max_uri_handlers += 2; // dual DAC role get/post
 #endif
   config.max_resp_headers = 8;
   config.stack_size = 8192;
@@ -986,6 +1075,18 @@ esp_err_t web_server_start(uint16_t port) {
                                      .method = HTTP_POST,
                                      .handler = sub_offset_post_handler};
   httpd_register_uri_handler(s_server, &sub_offset_post_uri);
+#endif
+
+#ifdef CONFIG_DAC_TAS58XX
+  httpd_uri_t dual_mode_get_uri = {.uri = "/api/audio/dual",
+                                   .method = HTTP_GET,
+                                   .handler = dual_mode_get_handler};
+  httpd_register_uri_handler(s_server, &dual_mode_get_uri);
+
+  httpd_uri_t dual_mode_post_uri = {.uri = "/api/audio/dual",
+                                    .method = HTTP_POST,
+                                    .handler = dual_mode_post_handler};
+  httpd_register_uri_handler(s_server, &dual_mode_post_uri);
 #endif
 
   httpd_uri_t ota_uri = {.uri = "/api/ota/update",

@@ -237,18 +237,33 @@ static const struct tas58xx_cmd_s tas5805m_init_seq[] = {
  * one device. */
 #define TAS58XX_MAX_DEVICES 2
 
+/* Input-mixer routing applied to a chip once it reaches PLAY. */
+typedef enum {
+  TAS58XX_MIX_STEREO = 0, /* chip default: L->L, R->R */
+  TAS58XX_MIX_MONO,       /* 0.5*L + 0.5*R -> both outputs */
+  TAS58XX_MIX_LEFT,       /* L -> both outputs */
+  TAS58XX_MIX_RIGHT,      /* R -> both outputs */
+} tas58xx_mix_t;
+
 /* Per-chip state. All chips share the same I2S stream and I2C bus. */
 typedef struct {
   uint8_t addr;                   /* 7-bit I2C address */
   tas58xx_model_t model;          /* TAS5805M / TAS5825M */
   i2c_master_dev_handle_t handle; /* I2C device handle */
   bool dsp_defaults_written;      /* signal-path coeffs programmed */
-  bool pbtl_mono;                 /* configured as PBTL mono subwoofer */
+  bool pbtl_mono;                 /* bridged (PBTL) mono output stage */
+  tas58xx_mix_t mix;              /* input-mixer routing */
 } tas58xx_dev_t;
 
 static tas58xx_dev_t s_devs[TAS58XX_MAX_DEVICES];
 static int s_dev_count = 0;
 static i2c_master_bus_handle_t s_bus_handle = NULL;
+
+/* Role of the second amplifier on dual-DAC boards. Read at init only. */
+static tas58xx_dual_mode_t s_dual_mode = TAS58XX_DUAL_SUB;
+
+/* Low-pass corner applied to the PBTL sub, 0 = full range. */
+static float s_sub_xover_hz = 0.0f;
 
 /* Sub level trim (dB) added to the master volume for sub devices, and the
  * cached master AirPlay volume so the trim can be re-applied on its own. */
@@ -288,7 +303,9 @@ static SemaphoreHandle_t s_reg_mutex = NULL;
 static esp_err_t tas58xx_write_reg(uint8_t reg, uint8_t value);
 static esp_err_t tas58xx_read_reg(uint8_t reg, uint8_t *value);
 static esp_err_t tas58xx_init_one(tas58xx_dev_t *dev);
-static esp_err_t tas58xx_apply_pbtl_mono(void);
+static esp_err_t tas58xx_apply_input_mix(void);
+static esp_err_t tas58xx_apply_sub_crossover(void);
+static esp_err_t tas58xx_apply_satellite_highpass(void);
 
 /* ---------- Detect ---------- */
 
@@ -332,6 +349,7 @@ static int tas58xx_detect(i2c_master_bus_handle_t bus) {
       s_devs[found].handle = NULL;
       s_devs[found].dsp_defaults_written = false;
       s_devs[found].pbtl_mono = false;
+      s_devs[found].mix = TAS58XX_MIX_STEREO;
       found++;
     }
   }
@@ -579,7 +597,7 @@ static esp_err_t tas58xx_init_one(tas58xx_dev_t *dev) {
                                         : tas5805m_init_seq;
 
   ESP_LOGI(TAG, "@0x%02X running init sequence (%s)...", dev->addr,
-           dev->pbtl_mono ? "PBTL mono sub" : "stereo");
+           dev->pbtl_mono ? "PBTL mono" : "BTL stereo");
   for (int i = 0; seq[i].reg != 0xFF; i++) {
     err = tas58xx_write_reg(seq[i].reg, seq[i].value);
     if (err != ESP_OK) {
@@ -603,11 +621,11 @@ static esp_err_t tas58xx_init_one(tas58xx_dev_t *dev) {
   }
 
   /*
-   * Configure the PBTL (mono) output stage for the subwoofer chip while
-   * still in HiZ. PBTL is a control-port setting (DEVICE_CTRL1 bit 2) and
-   * must be established before the output stage drives the paralleled
-   * load. The L+R summing (mono mixer) is a DSP-coefficient change applied
-   * once the device reaches PLAY (see tas58xx_apply_pbtl_mono()).
+   * Configure the PBTL (mono) output stage while still in HiZ. PBTL is a
+   * control-port setting (DEVICE_CTRL1 bit 2) and must be established
+   * before the output stage drives the paralleled load. The channel
+   * routing is a DSP-coefficient change applied once the device reaches
+   * PLAY (see tas58xx_apply_input_mix()).
    */
   if (dev->pbtl_mono) {
     uint8_t ctrl1 = 0;
@@ -661,16 +679,25 @@ static esp_err_t tas58xx_init(void *i2c_bus) {
   }
 
   /*
-   * Role assignment: the first detected chip drives the stereo
-   * satellites; any additional chip is configured as a mono subwoofer in
-   * PBTL (parallel bridge-tied load) mode. Both chips share the same I2S
-   * stream, so the sub sums L+R itself via its input mixer.
+   * Role assignment. A single chip always drives stereo satellites. On a
+   * dual-DAC board the second chip either drives a bridged (PBTL) mono
+   * subwoofer, or the pair splits into one amplifier per speaker (bi-amp),
+   * each fed from a single input channel.
    */
-  for (int i = 1; i < s_dev_count; i++) {
-    s_devs[i].pbtl_mono = true;
+  if (s_dev_count > 1) {
+    if (s_dual_mode == TAS58XX_DUAL_BIAMP) {
+      s_devs[0].mix = TAS58XX_MIX_LEFT;
+      s_devs[1].mix = TAS58XX_MIX_RIGHT;
+    } else {
+      s_devs[1].pbtl_mono = true;
+      s_devs[1].mix = TAS58XX_MIX_MONO;
+    }
+    ESP_LOGI(TAG, "Detected %d TAS58xx device(s) - %s", s_dev_count,
+             s_dual_mode == TAS58XX_DUAL_BIAMP ? "bi-amp (left/right)"
+                                               : "2.1 with PBTL mono sub");
+  } else {
+    ESP_LOGI(TAG, "Detected %d TAS58xx device(s) - stereo", s_dev_count);
   }
-
-  ESP_LOGI(TAG, "Detected %d TAS58xx device(s)", s_dev_count);
 
   REG_LOCK();
   for (int i = 0; i < s_dev_count; i++) {
@@ -784,10 +811,15 @@ static void set_power_mode_dev(tas58xx_dev_t *dev, dac_power_mode_t mode) {
     // Clear any faults from PLAY transition
     tas58xx_write_reg(REG_FAULT_CLEAR, 0x80);
 
-    // Re-apply the L+R mono mix for a PBTL subwoofer once the DSP is
-    // running (coefficient RAM writes require active I2S clocks).
+    // Re-apply the input-mixer routing once the DSP is running
+    // (coefficient RAM writes require active I2S clocks).
+    if (dev->mix != TAS58XX_MIX_STEREO) {
+      tas58xx_apply_input_mix();
+    }
     if (dev->pbtl_mono) {
-      tas58xx_apply_pbtl_mono();
+      tas58xx_apply_sub_crossover();
+    } else {
+      tas58xx_apply_satellite_highpass();
     }
 
     tas58xx_dump_status("power-on");
@@ -965,6 +997,55 @@ float dac_tas58xx_get_sub_offset_db(void) {
   return s_sub_offset_db;
 }
 
+void dac_tas58xx_set_sub_crossover_hz(float hz) {
+  if (hz < TAS58XX_XOVER_MIN_HZ) {
+    hz = 0.0f;
+  } else if (hz > TAS58XX_XOVER_MAX_HZ) {
+    hz = TAS58XX_XOVER_MAX_HZ;
+  }
+
+  // May be called before the DAC is initialised; the value is picked up when
+  // the sub next reaches PLAY.
+  if (s_reg_mutex == NULL) {
+    s_sub_xover_hz = hz;
+    return;
+  }
+
+  REG_LOCK();
+  s_sub_xover_hz = hz;
+  for (int i = 0; i < s_dev_count; i++) {
+    s_cur = &s_devs[i];
+    if (s_devs[i].pbtl_mono) {
+      tas58xx_apply_sub_crossover();
+    } else {
+      tas58xx_apply_satellite_highpass();
+    }
+  }
+  s_cur = NULL;
+  REG_UNLOCK();
+}
+
+float dac_tas58xx_get_sub_crossover_hz(void) {
+  return s_sub_xover_hz;
+}
+
+int dac_tas58xx_get_device_count(void) {
+  return s_dev_count;
+}
+
+tas58xx_dual_mode_t dac_tas58xx_get_dual_mode(void) {
+  return s_dual_mode;
+}
+
+void dac_tas58xx_set_dual_mode(tas58xx_dual_mode_t mode) {
+  if (mode != TAS58XX_DUAL_SUB && mode != TAS58XX_DUAL_BIAMP) {
+    return;
+  }
+  s_dual_mode = mode;
+  ESP_LOGI(TAG, "Second amplifier role: %s (applied at next init)",
+           mode == TAS58XX_DUAL_BIAMP ? "bi-amp L/R" : "PBTL mono sub");
+}
+
 /* ---------- Public ops struct ---------- */
 
 const dac_ops_t dac_tas58xx_ops = {
@@ -992,6 +1073,22 @@ static esp_err_t tas58xx_read_reg(uint8_t reg, uint8_t *value) {
 
 #define BQ_COEFF_BOOK 0xAA /* TAS5825M coefficient book */
 #define BQ_COEFF_SIZE 20   /* bytes per biquad (5 × 4) */
+
+/* Rate the coefficient tables and runtime filter designs assume; the audio
+ * pipeline resamples 44.1 kHz to 48 kHz before it reaches the DAC. */
+#define BQ_SAMPLE_RATE_HZ 48000.0
+
+/* EQ biquad slots borrowed by the crossover (two per chip = 4th order). */
+#define XOVER_BQ_SLOTS 2
+
+/* Last gain index programmed per band, so the borrowed slots can be handed
+ * back to the user EQ when the crossover is switched off. */
+static int s_eq_idx[TAS58XX_EQ_BANDS] = {
+    EQ_GAIN_OFFSET, EQ_GAIN_OFFSET, EQ_GAIN_OFFSET, EQ_GAIN_OFFSET,
+    EQ_GAIN_OFFSET, EQ_GAIN_OFFSET, EQ_GAIN_OFFSET, EQ_GAIN_OFFSET,
+    EQ_GAIN_OFFSET, EQ_GAIN_OFFSET, EQ_GAIN_OFFSET, EQ_GAIN_OFFSET,
+    EQ_GAIN_OFFSET, EQ_GAIN_OFFSET, EQ_GAIN_OFFSET,
+};
 
 /* Book / Page / Register for EQ mode control */
 #define EQ_MODE_BOOK 0x8C
@@ -1501,17 +1598,139 @@ static esp_err_t write_eq_mode(bool enable) {
 }
 
 /*
- * Configure the current chip (s_cur) to sum L+R into a mono channel for a
- * PBTL subwoofer. Switches the DSP to custom-coefficient mode and overrides
- * the input mixer so both output paths carry (L+R) at -6 dB. Assumes
- * REG_LOCK is held and s_cur points at the sub chip; the chip must be in
+ * Design a 2nd-order Butterworth-style low- or high-pass and pack it into the
+ * TI coefficient layout {b0, b1, b2, -a1, -a2} as 5.27 big-endian fixed point.
+ * Uses double precision because (1 - cos w0) suffers cancellation at the low
+ * corner frequencies a subwoofer crossover needs.
+ */
+static void design_xover_biquad(float fc, float q, bool highpass,
+                                uint8_t out[EQ_COEFF_BYTES]) {
+  const double w0 = 2.0 * M_PI * (double)fc / BQ_SAMPLE_RATE_HZ;
+  const double cosw = cos(w0);
+  const double alpha = sin(w0) / (2.0 * (double)q);
+  const double a0 = 1.0 + alpha;
+  const double num = highpass ? (1.0 + cosw) : (1.0 - cosw);
+  const double b1 = highpass ? -num : num;
+
+  const double coeff[5] = {
+      num * 0.5 / a0,     /* b0  */
+      b1 / a0,            /* b1  */
+      num * 0.5 / a0,     /* b2  */
+      2.0 * cosw / a0,    /* -a1 */
+      (alpha - 1.0) / a0, /* -a2 */
+  };
+
+  for (int i = 0; i < 5; i++) {
+    int32_t fixed = (int32_t)llround(coeff[i] * (double)(1 << 27));
+    out[i * 4 + 0] = (uint8_t)(fixed >> 24);
+    out[i * 4 + 1] = (uint8_t)(fixed >> 16);
+    out[i * 4 + 2] = (uint8_t)(fixed >> 8);
+    out[i * 4 + 3] = (uint8_t)fixed;
+  }
+}
+
+/* True when a PBTL sub is present and band-limited, i.e. the satellites
+ * should shed the bass the sub is now carrying. */
+static bool satellite_highpass_active(void) {
+  if (s_sub_xover_hz <= 0.0f) {
+    return false;
+  }
+  for (int i = 0; i < s_dev_count; i++) {
+    if (s_devs[i].pbtl_mono) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/*
+ * Load the sub low-pass into the current chip's EQ biquad chain. The 15 EQ
+ * slots are cascaded, and the user EQ deliberately skips the sub, so slots 0
+ * and 1 are free to hold the two Butterworth sections of a 4th-order
+ * Linkwitz-Riley (-24 dB/oct). Assumes REG_LOCK is held and the chip is in
+ * PLAY.
+ */
+static esp_err_t tas58xx_apply_sub_crossover(void) {
+  if (s_cur->model != TAS58XX_MODEL_TAS5825M) {
+    ESP_LOGW(TAG, "@0x%02X sub crossover only implemented for TAS5825M",
+             s_cur->addr);
+    return ESP_ERR_NOT_SUPPORTED;
+  }
+
+  static const uint8_t unity_bq_bytes[EQ_COEFF_BYTES] = {0x08};
+  uint8_t lpf[EQ_COEFF_BYTES];
+  if (s_sub_xover_hz > 0.0f) {
+    design_xover_biquad(s_sub_xover_hz, (float)M_SQRT1_2, false, lpf);
+  }
+
+  esp_err_t first_err = ESP_OK;
+  for (int bq = 0; bq < TAS58XX_EQ_BANDS; bq++) {
+    const uint8_t *data =
+        (s_sub_xover_hz > 0.0f && bq < XOVER_BQ_SLOTS) ? lpf : unity_bq_bytes;
+    esp_err_t err = program_biquad_raw(bq, data);
+    if (err != ESP_OK && first_err == ESP_OK) {
+      first_err = err;
+    }
+  }
+
+  if (s_sub_xover_hz > 0.0f) {
+    ESP_LOGI(TAG, "@0x%02X sub low-pass at %.0f Hz (LR4)", s_cur->addr,
+             (double)s_sub_xover_hz);
+  } else {
+    ESP_LOGI(TAG, "@0x%02X sub crossover disabled (full range)", s_cur->addr);
+  }
+  return first_err;
+}
+
+/*
+ * Load the complementary high-pass into a satellite chip (s_cur), so it stops
+ * duplicating the bass the sub now carries. Borrows the two lowest EQ bands,
+ * which sit below the corner and are therefore inaudible on the satellites
+ * anyway; when the crossover is off their user gains are restored.
+ * Assumes REG_LOCK is held and the chip is in PLAY.
+ */
+static esp_err_t tas58xx_apply_satellite_highpass(void) {
+  if (s_cur->model != TAS58XX_MODEL_TAS5825M) {
+    return ESP_ERR_NOT_SUPPORTED;
+  }
+
+  const bool active = satellite_highpass_active();
+  uint8_t hpf[EQ_COEFF_BYTES];
+  if (active) {
+    design_xover_biquad(s_sub_xover_hz, (float)M_SQRT1_2, true, hpf);
+  }
+
+  esp_err_t first_err = ESP_OK;
+  for (int bq = 0; bq < XOVER_BQ_SLOTS; bq++) {
+    const uint8_t *data = active ? hpf : eq_coeff_table[s_eq_idx[bq]][bq].bytes;
+    esp_err_t err = program_biquad_raw(bq, data);
+    if (err != ESP_OK && first_err == ESP_OK) {
+      first_err = err;
+    }
+  }
+
+  if (active) {
+    ESP_LOGI(TAG, "@0x%02X satellite high-pass at %.0f Hz (LR4)", s_cur->addr,
+             (double)s_sub_xover_hz);
+  }
+  return first_err;
+}
+
+/*
+ * Program the input mixer of the current chip (s_cur) for its assigned
+ * channel routing. Switches the DSP to custom-coefficient mode and
+ * overrides the mixer gains. Assumes REG_LOCK is held and the chip is in
  * PLAY (coefficient RAM writes require active I2S clocks).
  */
-static esp_err_t tas58xx_apply_pbtl_mono(void) {
+static esp_err_t tas58xx_apply_input_mix(void) {
+  if (s_cur->mix == TAS58XX_MIX_STEREO) {
+    return ESP_OK;
+  }
+
   if (s_cur->model != TAS58XX_MODEL_TAS5825M) {
     ESP_LOGW(TAG,
-             "@0x%02X PBTL mono mixer only implemented for TAS5825M; "
-             "sub will play the left channel only",
+             "@0x%02X input mixer only implemented for TAS5825M; "
+             "chip will play the left channel only",
              s_cur->addr);
     return ESP_ERR_NOT_SUPPORTED;
   }
@@ -1520,30 +1739,50 @@ static esp_err_t tas58xx_apply_pbtl_mono(void) {
    * defaults, then clears USE_DEFAULT_COEFFS). */
   esp_err_t err = ensure_custom_coeffs_mode();
   if (err != ESP_OK) {
-    ESP_LOGE(TAG, "@0x%02X PBTL: failed to enter custom coeff mode: %s",
+    ESP_LOGE(TAG, "@0x%02X mixer: failed to enter custom coeff mode: %s",
              s_cur->addr, esp_err_to_name(err));
     return err;
   }
 
   /*
-   * Override the input mixer (Book 0x8C, Page 0x0B) so that both output
-   * channels carry 0.5*L + 0.5*R. 0.5 == -6.02 dB == 0x00400000 in 9.23
-   * fixed point. In PBTL the paralleled output follows one channel, so
-   * summing into both makes the sub content independent of PBTL_CH_SEL.
+   * Input mixer gains live in Book 0x8C, Page 0x0B as 9.23 fixed point.
+   * In PBTL the paralleled output follows one channel, so feeding both
+   * output paths makes the content independent of PBTL_CH_SEL.
    */
-  static const int32_t HALF_9_23 = 0x00400000;
+  static const int32_t UNITY_9_23 = 0x00800000; /*  0 dB */
+  static const int32_t HALF_9_23 = 0x00400000;  /* -6 dB */
+
+  int32_t l_to_l = 0, r_to_l = 0, l_to_r = 0, r_to_r = 0;
+  const char *desc;
+  switch (s_cur->mix) {
+  case TAS58XX_MIX_MONO:
+    l_to_l = r_to_l = l_to_r = r_to_r = HALF_9_23;
+    desc = "mono L+R -6 dB";
+    break;
+  case TAS58XX_MIX_LEFT:
+    l_to_l = l_to_r = UNITY_9_23;
+    desc = "left channel";
+    break;
+  case TAS58XX_MIX_RIGHT:
+    r_to_l = r_to_r = UNITY_9_23;
+    desc = "right channel";
+    break;
+  default:
+    return ESP_OK;
+  }
+
   err = select_book_page(0x8C, 0x0B);
   if (err != ESP_OK) {
     select_default_page();
     return err;
   }
-  write_dsp_coeff32(0x0B, 0x14, HALF_9_23); /* L -> L */
-  write_dsp_coeff32(0x0B, 0x18, HALF_9_23); /* R -> L */
-  write_dsp_coeff32(0x0B, 0x1C, HALF_9_23); /* L -> R */
-  write_dsp_coeff32(0x0B, 0x20, HALF_9_23); /* R -> R */
+  write_dsp_coeff32(0x0B, 0x14, l_to_l);
+  write_dsp_coeff32(0x0B, 0x18, r_to_l);
+  write_dsp_coeff32(0x0B, 0x1C, l_to_r);
+  write_dsp_coeff32(0x0B, 0x20, r_to_r);
   err = select_default_page();
 
-  ESP_LOGI(TAG, "@0x%02X PBTL mono mixer applied (L+R -6 dB)", s_cur->addr);
+  ESP_LOGI(TAG, "@0x%02X input mixer applied (%s)", s_cur->addr, desc);
   return err;
 }
 
@@ -1567,6 +1806,10 @@ static esp_err_t eq_program_indices_dev(const int idx[TAS58XX_EQ_BANDS]) {
 
   esp_err_t first_err = ESP_OK;
   for (int i = 0; i < TAS58XX_EQ_BANDS; i++) {
+    s_eq_idx[i] = idx[i];
+    if (i < XOVER_BQ_SLOTS && satellite_highpass_active()) {
+      continue; /* slot holds the crossover high-pass */
+    }
     esp_err_t err = program_biquad_raw(i, eq_coeff_table[idx[i]][i].bytes);
     if (err != ESP_OK && first_err == ESP_OK) {
       first_err = err;
@@ -1626,6 +1869,12 @@ esp_err_t tas58xx_eq_set_band(int band, float gain_db) {
            eq_center_freq[band], gain_int, idx);
 
   REG_LOCK();
+  s_eq_idx[band] = idx;
+  if (band < XOVER_BQ_SLOTS && satellite_highpass_active()) {
+    REG_UNLOCK();
+    return ESP_OK; /* slot holds the crossover high-pass */
+  }
+
   esp_err_t first_err = ESP_OK;
   for (int d = 0; d < s_dev_count; d++) {
     if (s_devs[d].pbtl_mono) {

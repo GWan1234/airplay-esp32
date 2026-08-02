@@ -19,6 +19,8 @@ static const char *TAG = "settings";
 #define NVS_KEY_LED_BRIGHTNESS "led_bright"
 #define NVS_KEY_CHANNEL_MODE   "chan_mode"
 #define NVS_KEY_SUB_OFFSET     "sub_off"
+#define NVS_KEY_SUB_XOVER      "sub_xo"
+#define NVS_KEY_DUAL_MODE      "dual_mode"
 
 #define MAX_WIFI_SSID_LEN     32
 #define MAX_WIFI_PASSWORD_LEN 64
@@ -525,6 +527,90 @@ esp_err_t settings_set_sub_offset(float offset_db) {
     ESP_LOGI(TAG, "Saved sub offset: %.1f dB", offset_db);
   } else {
     ESP_LOGE(TAG, "Failed to save sub offset: %s", esp_err_to_name(err));
+  }
+  return err;
+}
+
+esp_err_t settings_get_sub_crossover(float *hz) {
+  if (!hz) {
+    return ESP_ERR_INVALID_ARG;
+  }
+
+  nvs_handle_t nvs;
+  esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READONLY, &nvs);
+  if (err != ESP_OK) {
+    return ESP_ERR_NOT_FOUND;
+  }
+
+  int32_t stored;
+  err = nvs_get_i32(nvs, NVS_KEY_SUB_XOVER, &stored);
+  nvs_close(nvs);
+  if (err == ESP_OK) {
+    *hz = (float)stored;
+  }
+  return err;
+}
+
+esp_err_t settings_set_sub_crossover(float hz) {
+  nvs_handle_t nvs;
+  esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs);
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG, "Failed to open NVS: %s", esp_err_to_name(err));
+    return err;
+  }
+
+  err = nvs_set_i32(nvs, NVS_KEY_SUB_XOVER, (int32_t)hz);
+  if (err == ESP_OK) {
+    err = nvs_commit(nvs);
+  }
+  nvs_close(nvs);
+
+  if (err == ESP_OK) {
+    ESP_LOGI(TAG, "Saved sub crossover: %.0f Hz", hz);
+  } else {
+    ESP_LOGE(TAG, "Failed to save sub crossover: %s", esp_err_to_name(err));
+  }
+  return err;
+}
+
+/* ================================================================== */
+/*  Dual DAC (second amplifier) role                                   */
+/* ================================================================== */
+
+esp_err_t settings_get_dual_mode(uint8_t *mode) {
+  if (!mode) {
+    return ESP_ERR_INVALID_ARG;
+  }
+
+  nvs_handle_t nvs;
+  esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READONLY, &nvs);
+  if (err != ESP_OK) {
+    return ESP_ERR_NOT_FOUND;
+  }
+
+  err = nvs_get_u8(nvs, NVS_KEY_DUAL_MODE, mode);
+  nvs_close(nvs);
+  return err;
+}
+
+esp_err_t settings_set_dual_mode(uint8_t mode) {
+  nvs_handle_t nvs;
+  esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs);
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG, "Failed to open NVS: %s", esp_err_to_name(err));
+    return err;
+  }
+
+  err = nvs_set_u8(nvs, NVS_KEY_DUAL_MODE, mode);
+  if (err == ESP_OK) {
+    err = nvs_commit(nvs);
+  }
+  nvs_close(nvs);
+
+  if (err == ESP_OK) {
+    ESP_LOGI(TAG, "Saved dual DAC mode: %d", mode);
+  } else {
+    ESP_LOGE(TAG, "Failed to save dual DAC mode: %s", esp_err_to_name(err));
   }
   return err;
 }

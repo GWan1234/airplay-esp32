@@ -167,3 +167,27 @@ esp_err_t settings_get_sub_offset(float *offset_db);
  * Save sub level offset (dB) to persistent storage.
  */
 esp_err_t settings_set_sub_offset(float offset_db);
+
+/**
+ * Get the saved sub low-pass crossover frequency in Hz (0 = full range).
+ */
+esp_err_t settings_get_sub_crossover(float *hz);
+
+/**
+ * Save the sub low-pass crossover frequency (Hz) to persistent storage.
+ */
+esp_err_t settings_set_sub_crossover(float hz);
+
+// ---- Dual DAC (second amplifier) role ----
+
+/**
+ * Get the saved second-amplifier role (tas58xx_dual_mode_t value).
+ * @param mode Output: 0 = PBTL mono sub, 1 = bi-amp left/right
+ * @return ESP_OK if found, error otherwise
+ */
+esp_err_t settings_get_dual_mode(uint8_t *mode);
+
+/**
+ * Save the second-amplifier role to persistent storage.
+ */
+esp_err_t settings_set_dual_mode(uint8_t mode);
