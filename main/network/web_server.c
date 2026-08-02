@@ -402,6 +402,36 @@ static esp_err_t led_brightness_post_handler(httpd_req_t *req) {
   return ESP_OK;
 }
 
+/* Read a whole request body into a NUL-terminated heap buffer. httpd_req_recv()
+ * can return a short read, so keep going until the declared length arrives. */
+static char *recv_body(httpd_req_t *req, size_t max_len) {
+  int len = req->content_len;
+  if (len <= 0 || (size_t)len > max_len) {
+    return NULL;
+  }
+  char *buf = malloc((size_t)len + 1);
+  if (!buf) {
+    return NULL;
+  }
+  int got = 0;
+  while (got < len) {
+    int r = httpd_req_recv(req, buf + got, (size_t)(len - got));
+    if (r <= 0) {
+      free(buf);
+      return NULL;
+    }
+    got += r;
+  }
+  buf[len] = '\0';
+  return buf;
+}
+
+/* True for a JSON number that is a whole value inside [lo, hi]. */
+static bool json_int_in_range(const cJSON *v, int lo, int hi) {
+  return cJSON_IsNumber(v) && v->valuedouble == (double)v->valueint &&
+         v->valueint >= lo && v->valueint <= hi;
+}
+
 static esp_err_t channel_mode_get_handler(httpd_req_t *req) {
   cJSON *json = cJSON_CreateObject();
   cJSON_AddNumberToObject(json, "mode", audio_output_get_channel_mode());
@@ -415,15 +445,14 @@ static esp_err_t channel_mode_get_handler(httpd_req_t *req) {
 }
 
 static esp_err_t channel_mode_post_handler(httpd_req_t *req) {
-  char content[64];
-  int ret = httpd_req_recv(req, content, sizeof(content) - 1);
-  if (ret <= 0) {
+  char *content = recv_body(req, 128);
+  if (!content) {
     httpd_resp_send_500(req);
     return ESP_FAIL;
   }
-  content[ret] = '\0';
 
   cJSON *json = cJSON_Parse(content);
+  free(content);
   if (!json) {
     httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON");
     return ESP_FAIL;
@@ -431,10 +460,11 @@ static esp_err_t channel_mode_post_handler(httpd_req_t *req) {
 
   cJSON *response = cJSON_CreateObject();
   cJSON *val = cJSON_GetObjectItem(json, "mode");
-  if (val && cJSON_IsNumber(val) && val->valuedouble >= AUDIO_CHANNEL_STEREO &&
-      val->valuedouble <= AUDIO_CHANNEL_MONO) {
-    audio_output_set_channel_mode((audio_channel_mode_t)val->valuedouble);
+  if (json_int_in_range(val, AUDIO_CHANNEL_STEREO, AUDIO_CHANNEL_MONO)) {
+    audio_output_set_channel_mode((audio_channel_mode_t)val->valueint);
     cJSON_AddBoolToObject(response, "success", true);
+    /* Boards with two amplifiers keep stereo whatever was asked for. */
+    cJSON_AddNumberToObject(response, "mode", audio_output_get_channel_mode());
   } else {
     cJSON_AddBoolToObject(response, "success", false);
     cJSON_AddStringToObject(response, "error", "Expected {\"mode\": 0-3}");
@@ -473,7 +503,10 @@ static bool way_read_array(const cJSON *obj, const char *name,
   }
   for (int i = 0; i < TAS58XX_WAY_BANDS; i++) {
     const cJSON *item = cJSON_GetArrayItem(arr, i);
-    out[i] = cJSON_IsNumber(item) ? (float)item->valuedouble : 0.0f;
+    if (!cJSON_IsNumber(item)) {
+      return false;
+    }
+    out[i] = (float)item->valuedouble;
   }
   return true;
 }
@@ -486,11 +519,11 @@ static void sub_eq_add_freqs(cJSON *parent) {
   way_add_array(parent, "freqs_high", f, true);
 }
 
-static void sub_eq_persist(void) {
+static esp_err_t sub_eq_persist(void) {
   float saved[2][SETTINGS_WAY_BANDS];
   dac_tas58xx_sub_eq_get_gains(TAS58XX_WAY_LOW, saved[0]);
   dac_tas58xx_sub_eq_get_gains(TAS58XX_WAY_HIGH, saved[1]);
-  settings_set_sub_eq(saved);
+  return settings_set_sub_eq(saved);
 }
 #endif /* CONFIG_DAC_TAS58XX */
 
@@ -529,24 +562,11 @@ static esp_err_t sub_offset_get_handler(httpd_req_t *req) {
 }
 
 static esp_err_t sub_offset_post_handler(httpd_req_t *req) {
-  int len = req->content_len;
-  if (len <= 0 || len > 2048) {
-    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid body size");
-    return ESP_FAIL;
-  }
-
-  char *content = malloc((size_t)len + 1);
+  char *content = recv_body(req, 2048);
   if (!content) {
-    httpd_resp_send_500(req);
+    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid body");
     return ESP_FAIL;
   }
-  int ret = httpd_req_recv(req, content, (size_t)len);
-  if (ret <= 0) {
-    free(content);
-    httpd_resp_send_500(req);
-    return ESP_FAIL;
-  }
-  content[ret] = '\0';
 
   cJSON *json = cJSON_Parse(content);
   free(content);
@@ -557,6 +577,7 @@ static esp_err_t sub_offset_post_handler(httpd_req_t *req) {
 
   cJSON *response = cJSON_CreateObject();
   bool handled = false;
+  esp_err_t save_err = ESP_OK;
 
   cJSON *val = cJSON_GetObjectItem(json, "offset");
   if (val && cJSON_IsNumber(val)) {
@@ -579,7 +600,7 @@ static esp_err_t sub_offset_post_handler(httpd_req_t *req) {
     dac_tas58xx_set_sub_crossover_hz(hz);
     settings_set_sub_crossover(dac_tas58xx_get_sub_crossover_hz());
     /* Moving the corner relayouts the bands and flattens the curves. */
-    sub_eq_persist();
+    save_err = sub_eq_persist();
     handled = true;
   }
 
@@ -596,13 +617,19 @@ static esp_err_t sub_offset_post_handler(httpd_req_t *req) {
       any = true;
     }
     if (any) {
-      sub_eq_persist();
+      esp_err_t e = sub_eq_persist();
+      if (save_err == ESP_OK) {
+        save_err = e;
+      }
       handled = true;
     }
   }
 #endif
 
-  if (handled) {
+  if (handled && save_err != ESP_OK) {
+    cJSON_AddBoolToObject(response, "success", false);
+    cJSON_AddStringToObject(response, "error", "Applied but could not save");
+  } else if (handled) {
     cJSON_AddBoolToObject(response, "success", true);
 #ifdef CONFIG_DAC_TAS58XX
     sub_eq_add_freqs(response);
@@ -640,15 +667,14 @@ static esp_err_t dual_mode_get_handler(httpd_req_t *req) {
 }
 
 static esp_err_t dual_mode_post_handler(httpd_req_t *req) {
-  char content[64];
-  int ret = httpd_req_recv(req, content, sizeof(content) - 1);
-  if (ret <= 0) {
+  char *content = recv_body(req, 128);
+  if (!content) {
     httpd_resp_send_500(req);
     return ESP_FAIL;
   }
-  content[ret] = '\0';
 
   cJSON *json = cJSON_Parse(content);
+  free(content);
   if (!json) {
     httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON");
     return ESP_FAIL;
@@ -656,21 +682,19 @@ static esp_err_t dual_mode_post_handler(httpd_req_t *req) {
 
   cJSON *response = cJSON_CreateObject();
   cJSON *val = cJSON_GetObjectItem(json, "mode");
-  if (val && cJSON_IsNumber(val) && val->valueint == TAS58XX_DUAL_BIAMP &&
-      !TAS58XX_BIAMP_SUPPORTED) {
+  if (!json_int_in_range(val, TAS58XX_DUAL_SUB, TAS58XX_DUAL_BIAMP)) {
+    cJSON_AddBoolToObject(response, "success", false);
+    cJSON_AddStringToObject(response, "error", "Expected {\"mode\": 0-1}");
+  } else if (val->valueint == TAS58XX_DUAL_BIAMP && !TAS58XX_BIAMP_SUPPORTED) {
     cJSON_AddBoolToObject(response, "success", false);
     cJSON_AddStringToObject(response, "error", "Bi-amp is not available");
-  } else if (val && cJSON_IsNumber(val) && val->valueint >= TAS58XX_DUAL_SUB &&
-             val->valueint <= TAS58XX_DUAL_BIAMP) {
+  } else {
     dac_tas58xx_set_dual_mode((tas58xx_dual_mode_t)val->valueint);
     settings_set_dual_mode((uint8_t)val->valueint);
     cJSON_AddBoolToObject(response, "success", true);
     /* PBTL is a control-port setting that can only be changed while the
      * output stage is idle, so the change lands on the next boot. */
     cJSON_AddBoolToObject(response, "restart_required", true);
-  } else {
-    cJSON_AddBoolToObject(response, "success", false);
-    cJSON_AddStringToObject(response, "error", "Expected {\"mode\": 0-1}");
   }
 
   char *json_str = cJSON_Print(response);
@@ -738,34 +762,21 @@ static bool biamp_apply_gain_member(const cJSON *gains, const char *name,
   return true;
 }
 
-static void biamp_persist_gains(void) {
+static esp_err_t biamp_persist_gains(void) {
   float saved[2][2][SETTINGS_WAY_BANDS];
   for (int spk = 0; spk < 2; spk++) {
     dac_tas58xx_biamp_get_gains(spk, TAS58XX_WAY_LOW, saved[spk][0]);
     dac_tas58xx_biamp_get_gains(spk, TAS58XX_WAY_HIGH, saved[spk][1]);
   }
-  settings_set_biamp_eq(saved);
+  return settings_set_biamp_eq(saved);
 }
 
 static esp_err_t biamp_post_handler(httpd_req_t *req) {
-  int len = req->content_len;
-  if (len <= 0 || len > 2048) {
-    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid body size");
-    return ESP_FAIL;
-  }
-
-  char *content = malloc((size_t)len + 1);
+  char *content = recv_body(req, 2048);
   if (!content) {
-    httpd_resp_send_500(req);
+    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid body");
     return ESP_FAIL;
   }
-  int ret = httpd_req_recv(req, content, (size_t)len);
-  if (ret <= 0) {
-    free(content);
-    httpd_resp_send_500(req);
-    return ESP_FAIL;
-  }
-  content[ret] = '\0';
 
   cJSON *json = cJSON_Parse(content);
   free(content);
@@ -775,6 +786,7 @@ static esp_err_t biamp_post_handler(httpd_req_t *req) {
   }
 
   bool handled = false;
+  esp_err_t save_err = ESP_OK;
   cJSON *response = cJSON_CreateObject();
 
   cJSON *xo = cJSON_GetObjectItem(json, "crossover");
@@ -782,7 +794,7 @@ static esp_err_t biamp_post_handler(httpd_req_t *req) {
     dac_tas58xx_set_biamp_crossover_hz((float)xo->valuedouble);
     settings_set_biamp_crossover(dac_tas58xx_get_biamp_crossover_hz());
     /* Moving the corner relayouts the bands and flattens the curves. */
-    biamp_persist_gains();
+    save_err = biamp_persist_gains();
     handled = true;
   }
 
@@ -800,12 +812,18 @@ static esp_err_t biamp_post_handler(httpd_req_t *req) {
     any |= biamp_apply_gain_member(gains, "r_low", 1, TAS58XX_WAY_LOW);
     any |= biamp_apply_gain_member(gains, "r_high", 1, TAS58XX_WAY_HIGH);
     if (any) {
-      biamp_persist_gains();
+      esp_err_t e = biamp_persist_gains();
+      if (save_err == ESP_OK) {
+        save_err = e;
+      }
       handled = true;
     }
   }
 
-  if (handled) {
+  if (handled && save_err != ESP_OK) {
+    cJSON_AddBoolToObject(response, "success", false);
+    cJSON_AddStringToObject(response, "error", "Applied but could not save");
+  } else if (handled) {
     cJSON_AddBoolToObject(response, "success", true);
     /* Band centres track the crossover, so hand the new layout back. */
     biamp_add_freqs(response);

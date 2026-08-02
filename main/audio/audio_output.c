@@ -181,8 +181,10 @@ esp_err_t audio_output_init(void) {
   }
 
   if (channel_mode != AUDIO_CHANNEL_STEREO && channel_mode_locked()) {
-    ESP_LOGI(TAG, "Dual DAC output: resetting channel mode to stereo");
-    audio_output_set_channel_mode(AUDIO_CHANNEL_STEREO);
+    ESP_LOGI(TAG, "Dual DAC output: ignoring saved channel mode");
+    // Not persisted: the preference is only meaningless while two amps are
+    // fitted, so keep it for if the board is ever reconfigured.
+    channel_mode = AUDIO_CHANNEL_STEREO;
   }
 
   i2s_chan_config_t chan_cfg =
@@ -349,7 +351,10 @@ audio_channel_mode_t audio_output_cycle_channel_mode(void) {
 }
 
 void audio_output_set_channel_mode(audio_channel_mode_t mode) {
-  if (mode > AUDIO_CHANNEL_MONO || channel_mode_locked()) {
+  if (channel_mode_locked()) {
+    return;
+  }
+  if (mode > AUDIO_CHANNEL_MONO) {
     mode = AUDIO_CHANNEL_STEREO;
   }
   channel_mode = mode;

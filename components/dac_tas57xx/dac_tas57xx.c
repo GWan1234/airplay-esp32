@@ -158,15 +158,21 @@ static void tas57xx_load_hf(int i, bool multi) {
     fseek(f, 0, SEEK_END);
     long size = ftell(f);
     fseek(f, 0, SEEK_SET);
-    uint8_t *buf = malloc(size);
-    if (buf && fread(buf, 1, size, f) == (size_t)size) {
-      d->hf_buf = buf;
-      d->hf_size = size;
-      tas57xx_write_hf(d->handle, buf);
-      ESP_LOGI(TAG, "Loaded HF %s for @0x%02X", path, d->addr);
+    // tas57xx_write_hf() scans for a two-byte 0xFF 0xFF terminator, so a
+    // truncated file would be read past the end of the buffer.
+    if (size < 2) {
+      ESP_LOGE(TAG, "HF file %s is empty or unreadable", path);
     } else {
-      ESP_LOGE(TAG, "Failed to read HF file %s", path);
-      free(buf);
+      uint8_t *buf = malloc((size_t)size);
+      if (buf && fread(buf, 1, (size_t)size, f) == (size_t)size) {
+        d->hf_buf = buf;
+        d->hf_size = size;
+        tas57xx_write_hf(d->handle, buf);
+        ESP_LOGI(TAG, "Loaded HF %s for @0x%02X", path, d->addr);
+      } else {
+        ESP_LOGE(TAG, "Failed to read HF file %s", path);
+        free(buf);
+      }
     }
     fclose(f);
     if (d->hf_buf) {

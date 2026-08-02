@@ -78,7 +78,7 @@ body{font-family:-apple-system,system-ui,sans-serif;background:linear-gradient(1
 <div class='slider-row'><input type='range' id='sub-level' min='-15' max='15' step='1' value='0' oninput='document.getElementById("sub-db").textContent=(this.value>0?"+":"")+this.value+" dB"'>
 <span id='sub-db'>0 dB</span></div></div>
 <div class='form-group' id='xo-group' style='display:none'><label for='sub-xo'>Crossover</label>
-<div class='slider-row'><input type='range' id='sub-xo' min='0' max='400' step='10' value='0' oninput='document.getElementById("xo-hz").textContent=this.value<40?"Off":this.value+" Hz"'>
+<div class='slider-row'><input type='range' id='sub-xo' min='0' max='400' step='10' value='0' oninput='xoLabel(this.value)'>
 <span id='xo-hz'>Off</span></div>
 <p class='hint'>Linkwitz-Riley 24 dB/oct. The sub is low-passed and the speakers are high-passed at this frequency. Moving it re-spaces the EQ bands below and resets them to flat.</p></div>
 <button class='btn btn-secondary' onclick='saveSub()'>Save Sub Settings</button>
@@ -187,6 +187,11 @@ var seFreqs={low:[],high:[]};
 var seGains={sat:[],sub:[]};
 var seCurve='sat';
 var seBands=12;
+/* Below the firmware's minimum corner the crossover is off entirely. */
+var seXoMin=40;
+function xoLabel(v){
+  document.getElementById('xo-hz').textContent=v<seXoMin?'Off':v+' Hz';
+}
 function seWayOf(key){return key==='sub'?'low':'high';}
 function seRender(){
   renderTabs('se-tabs',SE_CURVES,seCurve,function(k){seCurve=k;seRender();});
@@ -221,7 +226,8 @@ async function loadSub(){
     var s=document.getElementById('sub-level');s.min=d.min;s.max=d.max;s.value=d.offset;
     document.getElementById('sub-db').textContent=(d.offset>0?'+':'')+d.offset+' dB';
     if(d.xo_max){var x=document.getElementById('sub-xo');x.max=d.xo_max;x.value=d.crossover||0;
-      document.getElementById('xo-hz').textContent=x.value<40?'Off':x.value+' Hz';
+      seXoMin=d.xo_min||seXoMin;
+      xoLabel(x.value);
       document.getElementById('xo-group').style.display='';}
     document.getElementById('sub-card').style.display='';
     seLoad(d);}
@@ -258,7 +264,7 @@ async function saveSub(){
         seFreqs={low:d.freqs_low||seFreqs.low,high:d.freqs_high||seFreqs.high};
         seGains={sat:new Array(seBands).fill(0),sub:new Array(seBands).fill(0)};
         document.getElementById('se-apply-btn').disabled=true;
-        seApplyMode(body.crossover>=40);
+        seApplyMode(body.crossover>=seXoMin);
       }}
     else{submsg(d.error||'Failed','err');}}
   catch(e){submsg('Error saving sub settings','err');}

@@ -1865,6 +1865,8 @@ static bool satellite_highpass_active(void) {
 #define WAY_BAND_LOW_HZ  20.0
 #define WAY_BAND_HIGH_HZ 20000.0
 
+static const uint8_t unity_bq_bytes[EQ_COEFF_BYTES] = {0x08};
+
 /*
  * Spread a way's bands logarithmically across its passband and derive a Q
  * that makes adjacent bands overlap at their -3 dB points, so a flat set of
@@ -1895,10 +1897,8 @@ static const uint8_t *way_slot_coeffs(int bq, const uint8_t *xover_data,
                                       const float *gains, const float *freqs,
                                       float q,
                                       uint8_t scratch[EQ_COEFF_BYTES]) {
-  static const uint8_t unity_bq_bytes[EQ_COEFF_BYTES] = {0x08};
-
   if (bq < XOVER_BQ_SLOTS) {
-    return xover_data ? xover_data : unity_bq_bytes;
+    return xover_data;
   }
   const int band = bq - WAY_EQ_FIRST_BQ;
   if (band >= TAS58XX_WAY_BANDS || gains[band] == 0.0f) {
@@ -1934,10 +1934,12 @@ static esp_err_t tas58xx_apply_sub_crossover(void) {
   esp_err_t first_err = ESP_OK;
   for (int bq = 0; bq < TAS58XX_EQ_BANDS; bq++) {
     uint8_t scratch[EQ_COEFF_BYTES];
+    /* The shared 15-band EQ skips the sub entirely, so with the crossover off
+     * its whole chain is pass-through. */
     const uint8_t *data =
         active ? way_slot_coeffs(bq, lpf, s_sub_eq_gain[TAS58XX_WAY_LOW], freqs,
                                  q, scratch)
-               : way_slot_coeffs(bq, NULL, NULL, NULL, q, scratch);
+               : unity_bq_bytes;
     esp_err_t err = program_biquad_raw(bq, data);
     if (err != ESP_OK && first_err == ESP_OK) {
       first_err = err;
@@ -1970,7 +1972,9 @@ static esp_err_t tas58xx_apply_satellite_highpass(void) {
   esp_err_t first_err = ESP_OK;
 
   if (!active) {
-    for (int bq = 0; bq < XOVER_BQ_SLOTS; bq++) {
+    /* The per-way EQ owned every slot, not just the crossover ones, so the
+     * whole shared curve has to be rewritten. */
+    for (int bq = 0; bq < TAS58XX_EQ_BANDS; bq++) {
       esp_err_t err =
           program_biquad_raw(bq, eq_coeff_table[s_eq_idx[bq]][bq].bytes);
       if (err != ESP_OK && first_err == ESP_OK) {
@@ -2212,6 +2216,16 @@ static esp_err_t tas58xx_apply_input_mix(void) {
 /* Program a full set of per-band gain indices on the current chip (s_cur).
  * Assumes REG_LOCK is held and s_cur is set. */
 static esp_err_t eq_program_indices_dev(const int idx[TAS58XX_EQ_BANDS]) {
+  /* A crossover is running its own per-way EQ in these slots. Remember the
+   * gains so they can be restored when it is switched off, but touch nothing
+   * on the chip -- not even the mute, which would be audible for no reason. */
+  if (crossover_owns_eq_chain()) {
+    for (int i = 0; i < TAS58XX_EQ_BANDS; i++) {
+      s_eq_idx[i] = idx[i];
+    }
+    return ESP_OK;
+  }
+
   /* Mute to prevent DSP glitches while bulk-updating coefficients */
   uint8_t saved_ctrl2 = 0;
   tas58xx_read_reg(REG_DEVICE_CTRL2, &saved_ctrl2);
@@ -2222,9 +2236,6 @@ static esp_err_t eq_program_indices_dev(const int idx[TAS58XX_EQ_BANDS]) {
   esp_err_t first_err = ESP_OK;
   for (int i = 0; i < TAS58XX_EQ_BANDS; i++) {
     s_eq_idx[i] = idx[i];
-    if (crossover_owns_eq_chain()) {
-      continue; /* a crossover is running its own per-way EQ here */
-    }
     esp_err_t err = program_biquad_raw(i, eq_coeff_table[idx[i]][i].bytes);
     if (err != ESP_OK && first_err == ESP_OK) {
       first_err = err;
@@ -2237,6 +2248,13 @@ static esp_err_t eq_program_indices_dev(const int idx[TAS58XX_EQ_BANDS]) {
 }
 
 esp_err_t tas58xx_eq_enable(bool enable) {
+  /* Bypassing the biquad chain would also bypass the crossover, leaving the
+   * satellites full-range while the sub keeps its low-pass. */
+  if (!enable && crossover_owns_eq_chain()) {
+    ESP_LOGW(TAG, "EQ: bypass refused, a crossover owns the biquad chain");
+    return ESP_ERR_INVALID_STATE;
+  }
+
   REG_LOCK();
   esp_err_t first_err = ESP_OK;
 
