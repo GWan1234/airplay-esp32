@@ -39,6 +39,10 @@ menu "Board Configuration"
             bool "Esparagus Audio Brick (ESP32-S3, TAS58xx)"
             depends on IDF_TARGET_ESP32S3
 
+        config BOARD_ESPARAGUS_AUDIO_BRICK_DUAL_DAC
+            bool "Esparagus Audio Brick Dual DAC (ESP32-S3, 2x TAS5825M)"
+            depends on IDF_TARGET_ESP32S3
+
         config BOARD_WAVESHARE_ESP32P4
             bool "Waveshare ESP32-P4 Module Dev Kit"
             depends on IDF_TARGET_ESP32P4
@@ -67,6 +71,7 @@ menu "Board Configuration"
         default "esp32-generic" if BOARD_ESP32_GENERIC
         default "esparagus-audio-brick" if BOARD_ESPARAGUS_AUDIO_BRICK
         default "esparagus-audio-brick" if BOARD_ESPARAGUS_AUDIO_BRICK_S3
+        default "esparagus-audio-brick" if BOARD_ESPARAGUS_AUDIO_BRICK_DUAL_DAC
         default "waveshare-esp32p4" if BOARD_WAVESHARE_ESP32P4
         default "waveshare-esp32s3" if BOARD_WAVESHARE_ESP32S3_TOUCH_LCD_154
         default "esparagus-audio-brick" if BOARD_ESPARAGUS_LOUDER
@@ -161,6 +166,21 @@ menu "Board Configuration"
                 default -1
                 help
                     I2C clock GPIO pin for DAC control. Set to -1 if not used.
+
+            config DAC_PDN_GPIO
+                int "DAC power-down (PDN) GPIO"
+                default -1
+                help
+                    Active-low power-down/enable GPIO of the (primary) DAC.
+                    Driven high at boot to release the chip from shutdown.
+                    Set to -1 if the pin is hard-wired on the board.
+
+            config DAC_PDN2_GPIO
+                int "Secondary DAC power-down (PDN) GPIO"
+                default -1
+                help
+                    Same as DAC_PDN_GPIO but for the second DAC on dual-DAC
+                    boards. Set to -1 if there is no second DAC.
 
             config JACK_GPIO
                 int "Headphone Jack Detection GPIO"

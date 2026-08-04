@@ -66,7 +66,26 @@ input:focus{outline:none;border-color:#e94560}
 <div class='slider-row'><input type='range' id='led-brightness' min='0' max='255' value='128' oninput='document.getElementById("led-pct").textContent=Math.round(this.value/255*100)+"%"'>
 <span id='led-pct'>50%</span></div></div>
 <button class='btn btn-secondary' onclick='saveBrightness()'>Save Brightness</button>
-<div id='brightness-msg'></div></div>
+<div id='brightness-msg'></div>
+<div id='chan-group'>
+<div class='form-group' style='margin-top:18px'><label for='chan-mode'>Output Channel</label>
+<select id='chan-mode' onchange='saveChannel()'>
+<option value='0'>Stereo</option>
+<option value='1'>Left only</option>
+<option value='2'>Right only</option>
+<option value='3'>Mono (L+R)</option>
+</select></div>
+<div id='chan-msg'></div></div>
+<div id='dual-group' style='display:none;margin-top:18px'>
+<div class='form-group'><label for='dual-mode'>DAC Configuration</label>
+<select id='dual-mode' onchange='saveDual()'>
+<option value='0'>2.1 (Satellites / Sub)</option>
+<option value='1'>Bi-Amp</option>
+</select></div>
+<div id='dual-msg'></div></div>
+<div id='eq-link' style='display:none;margin-top:18px'>
+<a href='/eq' class='btn btn-secondary'>EQ Settings</a></div>
+</div>
 <div class='card'><h2>Firmware Update</h2>
 <div class='file-row'><input type='file' id='fw-file' accept='.bin' style='display:none'>
 <button class='btn btn-secondary' onclick='document.getElementById("fw-file").click()'>Choose File</button>
@@ -94,9 +113,6 @@ input:focus{outline:none;border-color:#e94560}
 <div class='card'><h2>WiFi Speedtest</h2>
 <p style='color:#888;font-size:13px;margin-bottom:12px'>Measure latency and throughput to this device</p>
 <a href='/speedtest' class='btn btn-primary'>Open Speedtest</a></div>
-<div class='card' id='eq-card' style='display:none'><h2>Equalizer</h2>
-<p style='color:#888;font-size:13px;margin-bottom:12px'>15-band parametric EQ for DAC tuning</p>
-<a href='/eq' class='btn btn-primary'>Open Equalizer</a></div>
 </div>
 <script>
 function msg(id,txt,type){var e=document.getElementById(id);if(e){e.innerHTML='<div class="msg '+type+'">'+txt+'</div>';setTimeout(function(){e.innerHTML='';},4000);}}
@@ -126,6 +142,56 @@ async function saveBrightness(){
   try{var r=await fetch('/api/led/brightness',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({brightness:v})});
     var d=await r.json();if(d.success){msg('brightness-msg','Saved!','ok');}else{msg('brightness-msg',d.error,'err');}}
   catch(e){msg('brightness-msg','Error','err');console.error('saveBrightness failed',e);}}
+async function loadChannel(){
+  try{var r=await fetch('/api/audio/channel');var d=await r.json();
+    if(d.success){document.getElementById('chan-mode').value=String(d.mode);
+      chanLocked=!!d.locked;}}
+  catch(e){console.warn('Could not load channel mode',e);}
+  applyAmpLayout();}
+var dualDevices=1;
+var dualMode=0;
+var chanLocked=false;
+var DUAL_WARN={
+  0:'Switch to 2.1 (Satellites / Sub)?\n\nThe second amplifier is reconfigured as PBTL mono: its OUT_A and OUT_B terminals must be bridged together and wired to a single subwoofer.\n\nRewire before restarting.',
+  1:'Switch to Bi-Amp?\n\nBoth amplifiers run as stereo BTL, with OUT_A driving the woofer and OUT_B the tweeter of one speaker.\n\nIf OUT_A and OUT_B are still bridged for a PBTL subwoofer you MUST unbridge them first — leaving them shorted drives the two outputs against each other and can damage the amplifier and its output filters.'
+};
+/* With two amps the DAC configuration already fixes the routing, so per-output
+   channel selection has no meaning. */
+function applyAmpLayout(){
+  document.getElementById('chan-group').style.display=
+    (chanLocked||dualDevices>1)?'none':'';
+}
+async function saveChannel(){
+  var v=Number.parseInt(document.getElementById('chan-mode').value,10);
+  try{var r=await fetch('/api/audio/channel',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode:v})});
+    var d=await r.json();if(d.success){msg('chan-msg','Saved!','ok');
+      /* The firmware may keep stereo regardless of what was asked for. */
+      if(typeof d.mode==='number'){document.getElementById('chan-mode').value=String(d.mode);}
+      chanLocked=!!d.locked;applyAmpLayout();}
+    else{msg('chan-msg',d.error,'err');}}
+  catch(e){msg('chan-msg','Error','err');console.error('saveChannel failed',e);}}
+async function loadDual(){
+  try{var r=await fetch('/api/audio/dual');if(!r.ok)return;var d=await r.json();
+    if(d.success&&d.devices>1){dualDevices=d.devices;dualMode=d.mode;
+      var sel=document.getElementById('dual-mode');
+      sel.value=String(d.mode);
+      if(!d.biamp){
+        sel.querySelector('option[value="1"]').disabled=true;
+        sel.querySelector('option[value="1"]').textContent='Bi-Amp (unavailable)';
+      }
+      document.getElementById('dual-group').style.display='';
+      if(d.restart_required){msg('dual-msg','Restart to apply the new wiring.','err');}}}
+  catch(e){console.warn('Could not load dual DAC mode',e);}
+  applyAmpLayout();}
+async function saveDual(){
+  var sel=document.getElementById('dual-mode');
+  var v=Number.parseInt(sel.value,10);
+  if(v!==dualMode&&!confirm(DUAL_WARN[v])){sel.value=String(dualMode);return;}
+  try{var r=await fetch('/api/audio/dual',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode:v})});
+    var d=await r.json();
+    if(d.success){dualMode=v;msg('dual-msg','Saved! Rewire the speakers, then restart to apply.','ok');}
+    else{sel.value=String(dualMode);msg('dual-msg',d.error,'err');}}
+  catch(e){sel.value=String(dualMode);msg('dual-msg','Error','err');console.error('saveDual failed',e);}}
 async function saveName(){
   var n=document.getElementById('dev-name').value.trim();if(!n){msg('name-msg','Enter a name','err');return;}
   try{var r=await fetch('/api/device/name',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:n})});
@@ -156,11 +222,11 @@ async function loadInfo(){
       document.getElementById('info-chan').textContent=i.wifi_channel||'-';
       document.getElementById('info-phy').textContent=i.wifi_phy||'-';
       document.getElementById('info-bssid').textContent=i.wifi_bssid||'-';
-      if(i.eq_supported){document.getElementById('eq-card').style.display='';}
+      if(i.eq_supported||i.sub_supported){document.getElementById('eq-link').style.display='';}
       document.getElementById('dev-name').placeholder=i.device_name||'';}}catch(e){}}
 window.onload=function(){
   document.getElementById('fw-file').onchange=function(e){var f=e.target.files[0];
     document.getElementById('fw-name').textContent=f?f.name:'No file selected';
     document.getElementById('ota-btn').disabled=!f;};
-  loadInfo();loadBrightness();setInterval(loadInfo,30000);};
+  loadInfo();loadBrightness();loadChannel();loadDual();setInterval(loadInfo,30000);};
 </script></body></html>

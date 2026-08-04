@@ -19,13 +19,45 @@
 #include "ota.h"
 #include "log_stream.h"
 #include "rtsp_server.h"
+#include "audio_output.h"
 #include "esp_app_desc.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
 #ifdef CONFIG_DAC_TAS58XX
 #include "eq_events.h"
+#include "dac_tas58xx.h"
 #include "dac_tas58xx_eq.h"
+#endif
+
+#ifdef CONFIG_DAC_TAS57XX
+#include "dac_tas57xx.h"
+#endif
+
+/* Sub level-trim (2.1 subwoofer) is exposed by both the TAS57xx and TAS58xx
+ * drivers with the same API shape. Map to whichever is configured so the
+ * /api/audio/sub endpoints work regardless of DAC. */
+#if defined(CONFIG_DAC_TAS57XX)
+#define DAC_HAS_SUB_OFFSET       1
+#define DAC_SUB_OFFSET_MIN_DB    TAS57XX_SUB_OFFSET_MIN_DB
+#define DAC_SUB_OFFSET_MAX_DB    TAS57XX_SUB_OFFSET_MAX_DB
+#define dac_get_sub_offset_db()  dac_tas57xx_get_sub_offset_db()
+#define dac_set_sub_offset_db(x) dac_tas57xx_set_sub_offset_db(x)
+/* The trim only moves devices flagged is_sub, which is index > 0, so a
+ * single-amplifier board has nothing for it to act on. */
+#define dac_has_sub() (dac_tas57xx_get_device_count() > 1)
+#elif defined(CONFIG_DAC_TAS58XX)
+#define DAC_HAS_SUB_OFFSET       1
+#define DAC_SUB_OFFSET_MIN_DB    TAS58XX_SUB_OFFSET_MIN_DB
+#define DAC_SUB_OFFSET_MAX_DB    TAS58XX_SUB_OFFSET_MAX_DB
+#define dac_get_sub_offset_db()  dac_tas58xx_get_sub_offset_db()
+#define dac_set_sub_offset_db(x) dac_tas58xx_set_sub_offset_db(x)
+/* Only dual-DAC boards have a sub, and only while the second amplifier is
+ * configured as a bridged mono subwoofer rather than a bi-amp channel. A role
+ * chosen but not yet restarted into does not count. */
+#define dac_has_sub()                    \
+  (dac_tas58xx_get_device_count() > 1 && \
+   dac_tas58xx_get_active_dual_mode() == TAS58XX_DUAL_SUB)
 #endif
 
 static const char *TAG = "web_server";
@@ -372,6 +404,472 @@ static esp_err_t led_brightness_post_handler(httpd_req_t *req) {
   return ESP_OK;
 }
 
+/* Read a whole request body into a NUL-terminated heap buffer. httpd_req_recv()
+ * can return a short read, so keep going until the declared length arrives. */
+static char *recv_body(httpd_req_t *req, size_t max_len) {
+  int len = req->content_len;
+  if (len <= 0 || (size_t)len > max_len) {
+    return NULL;
+  }
+  char *buf = malloc((size_t)len + 1);
+  if (!buf) {
+    return NULL;
+  }
+  int got = 0;
+  while (got < len) {
+    int r = httpd_req_recv(req, buf + got, (size_t)(len - got));
+    if (r <= 0) {
+      free(buf);
+      return NULL;
+    }
+    got += r;
+  }
+  buf[len] = '\0';
+  return buf;
+}
+
+/* True for a JSON number that is a whole value inside [lo, hi]. */
+static bool json_int_in_range(const cJSON *v, int lo, int hi) {
+  return cJSON_IsNumber(v) && v->valuedouble == (double)v->valueint &&
+         v->valueint >= lo && v->valueint <= hi;
+}
+
+static esp_err_t channel_mode_get_handler(httpd_req_t *req) {
+  cJSON *json = cJSON_CreateObject();
+  cJSON_AddNumberToObject(json, "mode", audio_output_get_channel_mode());
+  cJSON_AddBoolToObject(json, "locked", audio_output_channel_mode_locked());
+  cJSON_AddBoolToObject(json, "success", true);
+  char *json_str = cJSON_Print(json);
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_send(req, json_str, HTTPD_RESP_USE_STRLEN);
+  free(json_str);
+  cJSON_Delete(json);
+  return ESP_OK;
+}
+
+static esp_err_t channel_mode_post_handler(httpd_req_t *req) {
+  char *content = recv_body(req, 128);
+  if (!content) {
+    httpd_resp_send_500(req);
+    return ESP_FAIL;
+  }
+
+  cJSON *json = cJSON_Parse(content);
+  free(content);
+  if (!json) {
+    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON");
+    return ESP_FAIL;
+  }
+
+  cJSON *response = cJSON_CreateObject();
+  cJSON *val = cJSON_GetObjectItem(json, "mode");
+  if (json_int_in_range(val, AUDIO_CHANNEL_STEREO, AUDIO_CHANNEL_MONO)) {
+    audio_output_set_channel_mode((audio_channel_mode_t)val->valueint);
+    cJSON_AddBoolToObject(response, "success", true);
+    /* Boards with two amplifiers keep stereo whatever was asked for. */
+    cJSON_AddNumberToObject(response, "mode", audio_output_get_channel_mode());
+    cJSON_AddBoolToObject(response, "locked",
+                          audio_output_channel_mode_locked());
+  } else {
+    cJSON_AddBoolToObject(response, "success", false);
+    cJSON_AddStringToObject(response, "error", "Expected {\"mode\": 0-3}");
+  }
+
+  char *json_str = cJSON_Print(response);
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_send(req, json_str, HTTPD_RESP_USE_STRLEN);
+  free(json_str);
+  cJSON_Delete(json);
+  cJSON_Delete(response);
+  return ESP_OK;
+}
+
+#ifdef DAC_HAS_SUB_OFFSET
+#ifdef CONFIG_DAC_TAS58XX
+/* The NVS blob layout and the driver's band count are declared independently,
+ * so a change to either would silently truncate or overrun the other. */
+_Static_assert(SETTINGS_WAY_BANDS == TAS58XX_WAY_BANDS,
+               "settings/driver per-way band count mismatch");
+_Static_assert(SETTINGS_EQ_BANDS == TAS58XX_EQ_BANDS,
+               "settings/driver EQ band count mismatch");
+
+/* Both crossovers expose their EQ as 12-float curves plus the band centres
+ * they currently sit on, which move whenever the crossover moves. */
+static void way_add_array(cJSON *parent, const char *name,
+                          const float vals[TAS58XX_WAY_BANDS], bool whole_hz) {
+  cJSON *arr = cJSON_CreateArray();
+  for (int i = 0; i < TAS58XX_WAY_BANDS; i++) {
+    cJSON_AddItemToArray(
+        arr, cJSON_CreateNumber(whole_hz ? (double)(int)(vals[i] + 0.5f)
+                                         : (double)vals[i]));
+  }
+  cJSON_AddItemToObject(parent, name, arr);
+}
+
+static bool way_read_array(const cJSON *obj, const char *name,
+                           float out[TAS58XX_WAY_BANDS]) {
+  const cJSON *arr = cJSON_GetObjectItem(obj, name);
+  if (!arr || !cJSON_IsArray(arr) ||
+      cJSON_GetArraySize(arr) != TAS58XX_WAY_BANDS) {
+    return false;
+  }
+  for (int i = 0; i < TAS58XX_WAY_BANDS; i++) {
+    const cJSON *item = cJSON_GetArrayItem(arr, i);
+    if (!cJSON_IsNumber(item)) {
+      return false;
+    }
+    out[i] = (float)item->valuedouble;
+  }
+  return true;
+}
+
+static void sub_eq_add_freqs(cJSON *parent) {
+  float f[TAS58XX_WAY_BANDS];
+  dac_tas58xx_sub_band_freqs(TAS58XX_WAY_LOW, f);
+  way_add_array(parent, "freqs_low", f, true);
+  dac_tas58xx_sub_band_freqs(TAS58XX_WAY_HIGH, f);
+  way_add_array(parent, "freqs_high", f, true);
+}
+
+/* The driver only relayouts and flattens the bands when the corner actually
+ * moves, so hand the resulting state back rather than let the client guess. */
+static void sub_eq_add_state(cJSON *parent) {
+  cJSON_AddBoolToObject(parent, "eq_active", dac_tas58xx_sub_eq_active());
+  sub_eq_add_freqs(parent);
+
+  cJSON *gains = cJSON_CreateObject();
+  float curve[TAS58XX_WAY_BANDS];
+  dac_tas58xx_sub_eq_get_gains(TAS58XX_WAY_LOW, curve);
+  way_add_array(gains, "sub", curve, false);
+  dac_tas58xx_sub_eq_get_gains(TAS58XX_WAY_HIGH, curve);
+  way_add_array(gains, "sat", curve, false);
+  cJSON_AddItemToObject(parent, "gains", gains);
+}
+
+static esp_err_t sub_eq_persist(void) {
+  float saved[2][SETTINGS_WAY_BANDS];
+  dac_tas58xx_sub_eq_get_gains(TAS58XX_WAY_LOW, saved[0]);
+  dac_tas58xx_sub_eq_get_gains(TAS58XX_WAY_HIGH, saved[1]);
+  return settings_set_sub_eq(saved);
+}
+#endif /* CONFIG_DAC_TAS58XX */
+
+static esp_err_t sub_offset_get_handler(httpd_req_t *req) {
+  cJSON *json = cJSON_CreateObject();
+  cJSON_AddNumberToObject(json, "offset", dac_get_sub_offset_db());
+  cJSON_AddNumberToObject(json, "min", DAC_SUB_OFFSET_MIN_DB);
+  cJSON_AddNumberToObject(json, "max", DAC_SUB_OFFSET_MAX_DB);
+  cJSON_AddBoolToObject(json, "available", dac_has_sub());
+#ifdef CONFIG_DAC_TAS58XX
+  cJSON_AddNumberToObject(json, "crossover",
+                          dac_tas58xx_get_sub_crossover_hz());
+  cJSON_AddNumberToObject(json, "xo_min", TAS58XX_XOVER_MIN_HZ);
+  cJSON_AddNumberToObject(json, "xo_max", TAS58XX_XOVER_MAX_HZ);
+  cJSON_AddNumberToObject(json, "bands", TAS58XX_WAY_BANDS);
+  cJSON_AddNumberToObject(json, "min_db", TAS58XX_EQ_MIN_GAIN_DB);
+  cJSON_AddNumberToObject(json, "max_db", TAS58XX_EQ_MAX_GAIN_DB);
+  sub_eq_add_state(json);
+#endif
+  cJSON_AddBoolToObject(json, "success", true);
+  char *json_str = cJSON_Print(json);
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_send(req, json_str, HTTPD_RESP_USE_STRLEN);
+  free(json_str);
+  cJSON_Delete(json);
+  return ESP_OK;
+}
+
+static esp_err_t sub_offset_post_handler(httpd_req_t *req) {
+  char *content = recv_body(req, 2048);
+  if (!content) {
+    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid body");
+    return ESP_FAIL;
+  }
+
+  cJSON *json = cJSON_Parse(content);
+  free(content);
+  if (!json) {
+    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON");
+    return ESP_FAIL;
+  }
+
+  cJSON *response = cJSON_CreateObject();
+  bool handled = false;
+  esp_err_t save_err = ESP_OK;
+
+  cJSON *val = cJSON_GetObjectItem(json, "offset");
+  if (val && cJSON_IsNumber(val)) {
+    float off = (float)val->valuedouble;
+    if (off < DAC_SUB_OFFSET_MIN_DB) {
+      off = DAC_SUB_OFFSET_MIN_DB;
+    }
+    if (off > DAC_SUB_OFFSET_MAX_DB) {
+      off = DAC_SUB_OFFSET_MAX_DB;
+    }
+    dac_set_sub_offset_db(off);
+    settings_set_sub_offset(off);
+    handled = true;
+  }
+
+#ifdef CONFIG_DAC_TAS58XX
+  cJSON *xo = cJSON_GetObjectItem(json, "crossover");
+  if (xo && cJSON_IsNumber(xo)) {
+    float hz = (float)xo->valuedouble;
+    dac_tas58xx_set_sub_crossover_hz(hz);
+    settings_set_sub_crossover(dac_tas58xx_get_sub_crossover_hz());
+    /* Moving the corner relayouts the bands and flattens the curves. */
+    save_err = sub_eq_persist();
+    handled = true;
+  }
+
+  cJSON *gains = cJSON_GetObjectItem(json, "gains");
+  if (gains && cJSON_IsObject(gains)) {
+    float curve[TAS58XX_WAY_BANDS];
+    bool any = false;
+    if (way_read_array(gains, "sub", curve)) {
+      dac_tas58xx_sub_eq_set_gains(TAS58XX_WAY_LOW, curve);
+      any = true;
+    }
+    if (way_read_array(gains, "sat", curve)) {
+      dac_tas58xx_sub_eq_set_gains(TAS58XX_WAY_HIGH, curve);
+      any = true;
+    }
+    if (any) {
+      esp_err_t e = sub_eq_persist();
+      if (save_err == ESP_OK) {
+        save_err = e;
+      }
+      handled = true;
+    }
+  }
+#endif
+
+  if (handled && save_err != ESP_OK) {
+    cJSON_AddBoolToObject(response, "success", false);
+    cJSON_AddStringToObject(response, "error", "Applied but could not save");
+  } else if (handled) {
+    cJSON_AddBoolToObject(response, "success", true);
+#ifdef CONFIG_DAC_TAS58XX
+    sub_eq_add_state(response);
+#endif
+  } else {
+    cJSON_AddBoolToObject(response, "success", false);
+    cJSON_AddStringToObject(response, "error",
+                            "Expected {\"offset\": dB} or {\"crossover\": Hz}");
+  }
+
+  char *json_str = cJSON_Print(response);
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_send(req, json_str, HTTPD_RESP_USE_STRLEN);
+  free(json_str);
+  cJSON_Delete(json);
+  cJSON_Delete(response);
+  return ESP_OK;
+}
+#endif /* DAC_HAS_SUB_OFFSET */
+
+#ifdef CONFIG_DAC_TAS58XX
+/* Second-amplifier role on dual-DAC boards: bridged mono sub or bi-amp. */
+static esp_err_t dual_mode_get_handler(httpd_req_t *req) {
+  cJSON *json = cJSON_CreateObject();
+  cJSON_AddNumberToObject(json, "devices", dac_tas58xx_get_device_count());
+  cJSON_AddNumberToObject(json, "mode", dac_tas58xx_get_dual_mode());
+  cJSON_AddBoolToObject(json, "restart_required",
+                        dac_tas58xx_get_dual_mode() !=
+                            dac_tas58xx_get_active_dual_mode());
+  cJSON_AddBoolToObject(json, "biamp", TAS58XX_BIAMP_SUPPORTED);
+  cJSON_AddBoolToObject(json, "success", true);
+  char *json_str = cJSON_Print(json);
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_send(req, json_str, HTTPD_RESP_USE_STRLEN);
+  free(json_str);
+  cJSON_Delete(json);
+  return ESP_OK;
+}
+
+static esp_err_t dual_mode_post_handler(httpd_req_t *req) {
+  char *content = recv_body(req, 128);
+  if (!content) {
+    httpd_resp_send_500(req);
+    return ESP_FAIL;
+  }
+
+  cJSON *json = cJSON_Parse(content);
+  free(content);
+  if (!json) {
+    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON");
+    return ESP_FAIL;
+  }
+
+  cJSON *response = cJSON_CreateObject();
+  cJSON *val = cJSON_GetObjectItem(json, "mode");
+  if (!json_int_in_range(val, TAS58XX_DUAL_SUB, TAS58XX_DUAL_BIAMP)) {
+    cJSON_AddBoolToObject(response, "success", false);
+    cJSON_AddStringToObject(response, "error", "Expected {\"mode\": 0-1}");
+  } else if (val->valueint == TAS58XX_DUAL_BIAMP && !TAS58XX_BIAMP_SUPPORTED) {
+    cJSON_AddBoolToObject(response, "success", false);
+    cJSON_AddStringToObject(response, "error", "Bi-amp is not available");
+  } else {
+    dac_tas58xx_set_dual_mode((tas58xx_dual_mode_t)val->valueint);
+    settings_set_dual_mode((uint8_t)val->valueint);
+    cJSON_AddBoolToObject(response, "success", true);
+    /* PBTL is a control-port setting that can only be changed while the
+     * output stage is idle, so the change lands on the next boot. */
+    cJSON_AddBoolToObject(response, "restart_required", true);
+  }
+
+  char *json_str = cJSON_Print(response);
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_send(req, json_str, HTTPD_RESP_USE_STRLEN);
+  free(json_str);
+  cJSON_Delete(json);
+  cJSON_Delete(response);
+  return ESP_OK;
+}
+
+/* Bi-amp: woofer/tweeter crossover plus a 12-band EQ per way per speaker. */
+static void biamp_add_gain_array(cJSON *parent, const char *name, int dev,
+                                 tas58xx_way_t way) {
+  float gains[TAS58XX_WAY_BANDS];
+  dac_tas58xx_biamp_get_gains(dev, way, gains);
+  way_add_array(parent, name, gains, false);
+}
+
+static void biamp_add_freqs(cJSON *parent) {
+  float f[TAS58XX_WAY_BANDS];
+  dac_tas58xx_biamp_band_freqs(TAS58XX_WAY_LOW, f);
+  way_add_array(parent, "freqs_low", f, true);
+  dac_tas58xx_biamp_band_freqs(TAS58XX_WAY_HIGH, f);
+  way_add_array(parent, "freqs_high", f, true);
+}
+
+/* The driver only relayouts and flattens the bands when the corner actually
+ * moves, so hand the resulting state back rather than let the client guess. */
+static void biamp_add_state(cJSON *parent) {
+  biamp_add_freqs(parent);
+
+  cJSON *gains = cJSON_CreateObject();
+  biamp_add_gain_array(gains, "l_low", 0, TAS58XX_WAY_LOW);
+  biamp_add_gain_array(gains, "l_high", 0, TAS58XX_WAY_HIGH);
+  biamp_add_gain_array(gains, "r_low", 1, TAS58XX_WAY_LOW);
+  biamp_add_gain_array(gains, "r_high", 1, TAS58XX_WAY_HIGH);
+  cJSON_AddItemToObject(parent, "gains", gains);
+}
+
+static esp_err_t biamp_get_handler(httpd_req_t *req) {
+  cJSON *json = cJSON_CreateObject();
+  cJSON_AddBoolToObject(json, "active", dac_tas58xx_biamp_active());
+  cJSON_AddNumberToObject(json, "crossover",
+                          dac_tas58xx_get_biamp_crossover_hz());
+  cJSON_AddNumberToObject(json, "xo_min", TAS58XX_BIAMP_XOVER_MIN_HZ);
+  cJSON_AddNumberToObject(json, "xo_max", TAS58XX_BIAMP_XOVER_MAX_HZ);
+  cJSON_AddBoolToObject(json, "swap", dac_tas58xx_get_biamp_swap());
+  cJSON_AddNumberToObject(json, "bands", TAS58XX_WAY_BANDS);
+  cJSON_AddNumberToObject(json, "min_db", TAS58XX_EQ_MIN_GAIN_DB);
+  cJSON_AddNumberToObject(json, "max_db", TAS58XX_EQ_MAX_GAIN_DB);
+  biamp_add_state(json);
+
+  cJSON_AddBoolToObject(json, "success", true);
+  char *json_str = cJSON_Print(json);
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_send(req, json_str, HTTPD_RESP_USE_STRLEN);
+  free(json_str);
+  cJSON_Delete(json);
+  return ESP_OK;
+}
+
+/* Copy one "gains" member into the driver. Returns true if it was present. */
+static bool biamp_apply_gain_member(const cJSON *gains, const char *name,
+                                    int dev, tas58xx_way_t way) {
+  float vals[TAS58XX_WAY_BANDS];
+  if (!way_read_array(gains, name, vals)) {
+    return false;
+  }
+  dac_tas58xx_biamp_set_gains(dev, way, vals);
+  return true;
+}
+
+static esp_err_t biamp_persist_gains(void) {
+  float saved[2][2][SETTINGS_WAY_BANDS];
+  for (int spk = 0; spk < 2; spk++) {
+    dac_tas58xx_biamp_get_gains(spk, TAS58XX_WAY_LOW, saved[spk][0]);
+    dac_tas58xx_biamp_get_gains(spk, TAS58XX_WAY_HIGH, saved[spk][1]);
+  }
+  return settings_set_biamp_eq(saved);
+}
+
+static esp_err_t biamp_post_handler(httpd_req_t *req) {
+  char *content = recv_body(req, 2048);
+  if (!content) {
+    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid body");
+    return ESP_FAIL;
+  }
+
+  cJSON *json = cJSON_Parse(content);
+  free(content);
+  if (!json) {
+    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON");
+    return ESP_FAIL;
+  }
+
+  bool handled = false;
+  esp_err_t save_err = ESP_OK;
+  cJSON *response = cJSON_CreateObject();
+
+  cJSON *xo = cJSON_GetObjectItem(json, "crossover");
+  if (xo && cJSON_IsNumber(xo)) {
+    dac_tas58xx_set_biamp_crossover_hz((float)xo->valuedouble);
+    settings_set_biamp_crossover(dac_tas58xx_get_biamp_crossover_hz());
+    /* Moving the corner relayouts the bands and flattens the curves. */
+    save_err = biamp_persist_gains();
+    handled = true;
+  }
+
+  cJSON *swap = cJSON_GetObjectItem(json, "swap");
+  if (swap && cJSON_IsBool(swap)) {
+    dac_tas58xx_set_biamp_swap(cJSON_IsTrue(swap));
+    settings_set_biamp_swap(dac_tas58xx_get_biamp_swap());
+    handled = true;
+  }
+
+  cJSON *gains = cJSON_GetObjectItem(json, "gains");
+  if (gains && cJSON_IsObject(gains)) {
+    bool any = biamp_apply_gain_member(gains, "l_low", 0, TAS58XX_WAY_LOW);
+    any |= biamp_apply_gain_member(gains, "l_high", 0, TAS58XX_WAY_HIGH);
+    any |= biamp_apply_gain_member(gains, "r_low", 1, TAS58XX_WAY_LOW);
+    any |= biamp_apply_gain_member(gains, "r_high", 1, TAS58XX_WAY_HIGH);
+    if (any) {
+      esp_err_t e = biamp_persist_gains();
+      if (save_err == ESP_OK) {
+        save_err = e;
+      }
+      handled = true;
+    }
+  }
+
+  if (handled && save_err != ESP_OK) {
+    cJSON_AddBoolToObject(response, "success", false);
+    cJSON_AddStringToObject(response, "error", "Applied but could not save");
+  } else if (handled) {
+    cJSON_AddBoolToObject(response, "success", true);
+    /* Band centres track the crossover, so hand the new layout back. */
+    biamp_add_state(response);
+  } else {
+    cJSON_AddBoolToObject(response, "success", false);
+    cJSON_AddStringToObject(
+        response, "error", "Expected \"crossover\", \"swap\" and/or \"gains\"");
+  }
+
+  char *json_str = cJSON_Print(response);
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_send(req, json_str, HTTPD_RESP_USE_STRLEN);
+  free(json_str);
+  cJSON_Delete(json);
+  cJSON_Delete(response);
+  return ESP_OK;
+}
+#endif /* CONFIG_DAC_TAS58XX */
+
 static esp_err_t ota_update_handler(httpd_req_t *req) {
   if (req->content_len == 0) {
     httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "No firmware uploaded");
@@ -463,6 +961,11 @@ static esp_err_t system_info_handler(httpd_req_t *req) {
   cJSON_AddBoolToObject(info, "eq_supported", true);
 #else
   cJSON_AddBoolToObject(info, "eq_supported", false);
+#endif
+#ifdef DAC_HAS_SUB_OFFSET
+  cJSON_AddBoolToObject(info, "sub_supported", dac_has_sub());
+#else
+  cJSON_AddBoolToObject(info, "sub_supported", false);
 #endif
 
   cJSON_AddItemToObject(json, "info", info);
@@ -766,7 +1269,14 @@ esp_err_t web_server_start(uint16_t port) {
 #endif
   config.lru_purge_enable = true; // Reclaim stale sockets when all are in use
   config.max_uri_handlers =
-      28; // Room for captive portal + EQ + speedtest + brightness
+      30; // Room for captive portal + EQ + speedtest + brightness + channel
+#ifdef DAC_HAS_SUB_OFFSET
+  config.max_uri_handlers += 2; // sub level get/post
+#endif
+#ifdef CONFIG_DAC_TAS58XX
+  config.max_uri_handlers += 2; // dual DAC role get/post
+  config.max_uri_handlers += 2; // bi-amp get/post
+#endif
   config.max_resp_headers = 8;
   config.stack_size = 8192;
 
@@ -834,6 +1344,50 @@ esp_err_t web_server_start(uint16_t port) {
                                          .handler =
                                              led_brightness_post_handler};
   httpd_register_uri_handler(s_server, &led_brightness_post_uri);
+
+  httpd_uri_t channel_mode_get_uri = {.uri = "/api/audio/channel",
+                                      .method = HTTP_GET,
+                                      .handler = channel_mode_get_handler};
+  httpd_register_uri_handler(s_server, &channel_mode_get_uri);
+
+  httpd_uri_t channel_mode_post_uri = {.uri = "/api/audio/channel",
+                                       .method = HTTP_POST,
+                                       .handler = channel_mode_post_handler};
+  httpd_register_uri_handler(s_server, &channel_mode_post_uri);
+
+#ifdef DAC_HAS_SUB_OFFSET
+  httpd_uri_t sub_offset_get_uri = {.uri = "/api/audio/sub",
+                                    .method = HTTP_GET,
+                                    .handler = sub_offset_get_handler};
+  httpd_register_uri_handler(s_server, &sub_offset_get_uri);
+
+  httpd_uri_t sub_offset_post_uri = {.uri = "/api/audio/sub",
+                                     .method = HTTP_POST,
+                                     .handler = sub_offset_post_handler};
+  httpd_register_uri_handler(s_server, &sub_offset_post_uri);
+#endif
+
+#ifdef CONFIG_DAC_TAS58XX
+  httpd_uri_t dual_mode_get_uri = {.uri = "/api/audio/dual",
+                                   .method = HTTP_GET,
+                                   .handler = dual_mode_get_handler};
+  httpd_register_uri_handler(s_server, &dual_mode_get_uri);
+
+  httpd_uri_t dual_mode_post_uri = {.uri = "/api/audio/dual",
+                                    .method = HTTP_POST,
+                                    .handler = dual_mode_post_handler};
+  httpd_register_uri_handler(s_server, &dual_mode_post_uri);
+
+  httpd_uri_t biamp_get_uri = {.uri = "/api/audio/biamp",
+                               .method = HTTP_GET,
+                               .handler = biamp_get_handler};
+  httpd_register_uri_handler(s_server, &biamp_get_uri);
+
+  httpd_uri_t biamp_post_uri = {.uri = "/api/audio/biamp",
+                                .method = HTTP_POST,
+                                .handler = biamp_post_handler};
+  httpd_register_uri_handler(s_server, &biamp_post_uri);
+#endif
 
   httpd_uri_t ota_uri = {.uri = "/api/ota/update",
                          .method = HTTP_POST,

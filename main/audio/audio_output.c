@@ -4,6 +4,7 @@
 #include "audio_resample.h"
 #include "dac.h"
 #include "led.h"
+#include "settings.h"
 #include "driver/i2s_std.h"
 #include "driver/gpio.h"
 #include "esp_check.h"
@@ -12,6 +13,12 @@
 #include "audio_receiver.h"
 #include <inttypes.h>
 #include <stdlib.h>
+#ifdef CONFIG_DAC_TAS58XX
+#include "dac_tas58xx.h"
+#endif
+#ifdef CONFIG_DAC_TAS57XX
+#include "dac_tas57xx.h"
+#endif
 
 // SIDE NOTE; providing power from GPIO pins is capped ~20mA.
 #if CONFIG_I2S_GND_IO >= 0
@@ -85,10 +92,19 @@ static void apply_volume(int16_t *buf, size_t n) {
 
 // Apply the selected channel mode to an interleaved stereo buffer (L,R,...).
 // LEFT/RIGHT route the chosen source channel to BOTH outputs so the selected
-// track is heard from both speakers; STEREO leaves the buffer untouched.
+// track is heard from both speakers; MONO plays the (L+R)/2 downmix on both
+// outputs; STEREO leaves the buffer untouched.
 static void apply_channel_mode(int16_t *buf, size_t frames) {
   audio_channel_mode_t mode = channel_mode;
   if (mode == AUDIO_CHANNEL_STEREO) {
+    return;
+  }
+  if (mode == AUDIO_CHANNEL_MONO) {
+    for (size_t i = 0; i < frames; i++) {
+      int16_t m = (int16_t)(((int32_t)buf[i * 2] + buf[i * 2 + 1]) / 2);
+      buf[i * 2] = m;
+      buf[i * 2 + 1] = m;
+    }
     return;
   }
   size_t src = (mode == AUDIO_CHANNEL_RIGHT) ? 1 : 0;
@@ -158,6 +174,21 @@ static void playback_task(void *arg) {
 }
 
 esp_err_t audio_output_init(void) {
+  uint8_t saved_mode;
+  if (settings_get_channel_mode(&saved_mode) == ESP_OK &&
+      saved_mode <= AUDIO_CHANNEL_MONO) {
+    channel_mode = (audio_channel_mode_t)saved_mode;
+    ESP_LOGI(TAG, "Loaded channel mode: %d", saved_mode);
+  }
+
+  if (channel_mode != AUDIO_CHANNEL_STEREO &&
+      audio_output_channel_mode_locked()) {
+    ESP_LOGI(TAG, "Dual DAC output: ignoring saved channel mode");
+    // Not persisted: the preference is only meaningless while two amps are
+    // fitted, so keep it for if the board is ever reconfigured.
+    channel_mode = AUDIO_CHANNEL_STEREO;
+  }
+
   i2s_chan_config_t chan_cfg =
       I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
   chan_cfg.dma_desc_num = I2S_DMA_DESC_NUM;
@@ -288,7 +319,26 @@ uint32_t audio_output_get_hardware_latency_us(void) {
                     OUTPUT_RATE);
 }
 
+/* With two amplifiers the DAC configuration already fixes the routing, so a
+ * channel selection on top of that would only mute a speaker. */
+bool audio_output_channel_mode_locked(void) {
+#ifdef CONFIG_DAC_TAS58XX
+  if (dac_tas58xx_get_device_count() > 1) {
+    return true;
+  }
+#endif
+#ifdef CONFIG_DAC_TAS57XX
+  if (dac_tas57xx_get_device_count() > 1) {
+    return true;
+  }
+#endif
+  return false;
+}
+
 audio_channel_mode_t audio_output_cycle_channel_mode(void) {
+  if (audio_output_channel_mode_locked()) {
+    return channel_mode;
+  }
   audio_channel_mode_t next;
   switch (channel_mode) {
   case AUDIO_CHANNEL_STEREO:
@@ -297,16 +347,31 @@ audio_channel_mode_t audio_output_cycle_channel_mode(void) {
   case AUDIO_CHANNEL_LEFT:
     next = AUDIO_CHANNEL_RIGHT;
     break;
+  case AUDIO_CHANNEL_RIGHT:
+    next = AUDIO_CHANNEL_MONO;
+    break;
   default:
     next = AUDIO_CHANNEL_STEREO;
     break;
   }
-  channel_mode = next;
-  ESP_LOGI(TAG, "Channel mode: %s",
-           next == AUDIO_CHANNEL_LEFT    ? "LEFT only"
-           : next == AUDIO_CHANNEL_RIGHT ? "RIGHT only"
-                                         : "STEREO");
+  audio_output_set_channel_mode(next);
   return next;
+}
+
+void audio_output_set_channel_mode(audio_channel_mode_t mode) {
+  if (audio_output_channel_mode_locked()) {
+    return;
+  }
+  if (mode > AUDIO_CHANNEL_MONO) {
+    mode = AUDIO_CHANNEL_STEREO;
+  }
+  channel_mode = mode;
+  settings_set_channel_mode((uint8_t)mode);
+  ESP_LOGI(TAG, "Channel mode: %s",
+           mode == AUDIO_CHANNEL_LEFT    ? "LEFT only"
+           : mode == AUDIO_CHANNEL_RIGHT ? "RIGHT only"
+           : mode == AUDIO_CHANNEL_MONO  ? "MONO (L+R)"
+                                         : "STEREO");
 }
 
 audio_channel_mode_t audio_output_get_channel_mode(void) {

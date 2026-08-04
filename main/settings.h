@@ -138,3 +138,106 @@ esp_err_t settings_clear_eq(void);
  * Check if EQ gains are saved.
  */
 bool settings_has_eq(void);
+
+// ---- Output channel mode ----
+
+/**
+ * Get saved output channel mode (audio_channel_mode_t value).
+ * @param mode Output: channel mode enum value
+ * @return ESP_OK if found, error otherwise
+ */
+esp_err_t settings_get_channel_mode(uint8_t *mode);
+
+/**
+ * Save output channel mode to persistent storage.
+ * @param mode audio_channel_mode_t value
+ */
+esp_err_t settings_set_channel_mode(uint8_t mode);
+
+// ---- Sub level offset ----
+
+/**
+ * Get saved sub level offset in dB (relative to master volume).
+ * @param offset_db Output: offset in dB
+ * @return ESP_OK if found, error otherwise
+ */
+esp_err_t settings_get_sub_offset(float *offset_db);
+
+/**
+ * Save sub level offset (dB) to persistent storage.
+ */
+esp_err_t settings_set_sub_offset(float offset_db);
+
+/**
+ * Get the saved sub low-pass crossover frequency in Hz (0 = full range).
+ */
+esp_err_t settings_get_sub_crossover(float *hz);
+
+/**
+ * Save the sub low-pass crossover frequency (Hz) to persistent storage.
+ */
+esp_err_t settings_set_sub_crossover(float hz);
+
+// ---- Dual DAC (second amplifier) role ----
+
+/**
+ * Get the saved second-amplifier role (tas58xx_dual_mode_t value).
+ * @param mode Output: 0 = PBTL mono sub, 1 = bi-amp left/right
+ * @return ESP_OK if found, error otherwise
+ */
+esp_err_t settings_get_dual_mode(uint8_t *mode);
+
+/**
+ * Save the second-amplifier role to persistent storage.
+ */
+esp_err_t settings_set_dual_mode(uint8_t mode);
+
+// ---- Crossover per-way EQ (2.1 and bi-amp) ----
+
+/** EQ bands per way on either side of a crossover. */
+#define SETTINGS_WAY_BANDS 12
+
+/**
+ * Get the saved 2.1 per-way EQ gains, indexed [way][band] where way 0 is the
+ * sub and way 1 the satellites.
+ */
+esp_err_t settings_get_sub_eq(float gains_db[2][SETTINGS_WAY_BANDS]);
+
+/**
+ * Save the 2.1 per-way EQ gains.
+ */
+esp_err_t settings_set_sub_eq(const float gains_db[2][SETTINGS_WAY_BANDS]);
+
+// ---- Bi-amp (two-way active crossover) ----
+
+/**
+ * Get the saved woofer/tweeter crossover frequency in Hz.
+ */
+esp_err_t settings_get_biamp_crossover(float *hz);
+
+/**
+ * Save the woofer/tweeter crossover frequency (Hz).
+ */
+esp_err_t settings_set_biamp_crossover(float hz);
+
+/**
+ * Get which amplifier output of each chip drives the woofer.
+ * @param swap Output: false = first output, true = second
+ */
+esp_err_t settings_get_biamp_swap(bool *swap);
+
+/**
+ * Save which amplifier output of each chip drives the woofer.
+ */
+esp_err_t settings_set_biamp_swap(bool swap);
+
+/**
+ * Get the saved bi-amp EQ gains, indexed [speaker][way][band] where
+ * speaker 0 = left, 1 = right and way 0 = woofer, 1 = tweeter.
+ */
+esp_err_t settings_get_biamp_eq(float gains_db[2][2][SETTINGS_WAY_BANDS]);
+
+/**
+ * Save the bi-amp EQ gains.
+ */
+esp_err_t settings_set_biamp_eq(const float gains_db[2][2][SETTINGS_WAY_BANDS]);

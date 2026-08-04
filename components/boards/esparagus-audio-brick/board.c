@@ -51,6 +51,7 @@ static void on_rtsp_event(rtsp_event_t event, const rtsp_event_data_t *data,
 static void on_eq_event(eq_event_t event, const eq_event_data_t *data,
                         void *user_data);
 static esp_err_t init_spkfault_gpio(void);
+static esp_err_t init_dac_pdn_gpios(void);
 static void restore_eq_from_nvs(void);
 
 const char *iot_board_get_info(void) {
@@ -80,6 +81,7 @@ board_res_handle_t iot_board_get_handle(int id) {
   }
 }
 
+#if BOARD_SPKFAULT_GPIO >= 0
 // Speaker fault ISR — notifies the handler task, no I2C calls from ISR
 static void IRAM_ATTR spkfault_isr_handler(void *arg) {
   (void)arg;
@@ -126,6 +128,7 @@ static void spkfault_task(void *arg) {
     }
   }
 }
+#endif /* BOARD_SPKFAULT_GPIO >= 0 */
 
 esp_err_t iot_board_init(void) {
   if (s_board_initialized) {
@@ -136,6 +139,12 @@ esp_err_t iot_board_init(void) {
   // Register and initialize DAC
   dac_register(&dac_tas58xx_ops);
 
+  // Release the DAC(s) from shutdown before anything probes the I2C bus
+  esp_err_t err = init_dac_pdn_gpios();
+  if (err != ESP_OK) {
+    return err;
+  }
+
   // Initialize I2C bus (board owns the bus lifetime)
   i2c_master_bus_config_t i2c_cfg = {
       .i2c_port = BOARD_I2C_PORT,
@@ -145,7 +154,7 @@ esp_err_t iot_board_init(void) {
       .glitch_ignore_cnt = 7,
       .flags.enable_internal_pullup = true,
   };
-  esp_err_t err = i2c_new_master_bus(&i2c_cfg, &s_i2c_bus_handle);
+  err = i2c_new_master_bus(&i2c_cfg, &s_i2c_bus_handle);
   if (err != ESP_OK) {
     ESP_LOGE(TAG, "Failed to initialize I2C bus: %s", esp_err_to_name(err));
     return err;
@@ -259,6 +268,45 @@ static void on_rtsp_event(rtsp_event_t event, const rtsp_event_data_t *data,
   case RTSP_EVENT_METADATA:
     break;
   }
+}
+
+/**
+ * Drive the TAS58xx PDN (active-low power-down) pins high so the chips answer
+ * on I2C. Boards that hard-wire PDN leave the GPIOs configured as -1.
+ */
+static esp_err_t init_dac_pdn_gpios(void) {
+#if BOARD_DAC_PDN_GPIO >= 0 || BOARD_DAC_PDN2_GPIO >= 0
+  uint64_t pins = 0;
+#if BOARD_DAC_PDN_GPIO >= 0
+  pins |= 1ULL << BOARD_DAC_PDN_GPIO;
+#endif
+#if BOARD_DAC_PDN2_GPIO >= 0
+  pins |= 1ULL << BOARD_DAC_PDN2_GPIO;
+#endif
+
+  gpio_config_t pdn_cfg = {
+      .pin_bit_mask = pins,
+      .mode = GPIO_MODE_OUTPUT,
+      .pull_up_en = GPIO_PULLUP_DISABLE,
+      .pull_down_en = GPIO_PULLDOWN_DISABLE,
+      .intr_type = GPIO_INTR_DISABLE,
+  };
+  esp_err_t err = gpio_config(&pdn_cfg);
+  ESP_RETURN_ON_ERROR(err, TAG, "Failed to configure DAC PDN GPIOs");
+
+#if BOARD_DAC_PDN_GPIO >= 0
+  gpio_set_level(BOARD_DAC_PDN_GPIO, 1);
+#endif
+#if BOARD_DAC_PDN2_GPIO >= 0
+  gpio_set_level(BOARD_DAC_PDN2_GPIO, 1);
+#endif
+
+  // TAS58xx needs ~5 ms after PDN release before it accepts I2C traffic
+  vTaskDelay(pdMS_TO_TICKS(10));
+  ESP_LOGI(TAG, "DAC PDN released (pdn=%d, pdn2=%d)", BOARD_DAC_PDN_GPIO,
+           BOARD_DAC_PDN2_GPIO);
+#endif
+  return ESP_OK;
 }
 
 static esp_err_t init_spkfault_gpio(void) {
