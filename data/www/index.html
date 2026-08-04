@@ -99,6 +99,8 @@ input:focus{outline:none;border-color:#e94560}
 <div class='info-item'><label>Device Name</label><span id='info-name'>-</span></div>
 <div class='info-item'><label>Free Memory</label><span id='info-heap'>-</span></div>
 <div class='info-item'><label>Firmware</label><span id='info-fw'>-</span></div>
+<div class='info-item'><label>Uptime</label><span id='info-uptime'>-</span></div>
+<div class='info-item'><label>Last reset</label><span id='info-reset'>-</span></div>
 <div class='info-item'><label>WiFi SSID</label><span id='info-ssid'>-</span></div>
 <div class='info-item'><label>WiFi RSSI</label><span id='info-rssi'>-</span></div>
 <div class='info-item'><label>WiFi Channel</label><span id='info-chan'>-</span></div>
@@ -216,6 +218,10 @@ async function loadInfo(){
       document.getElementById('info-name').textContent=i.device_name||'-';
       document.getElementById('info-heap').textContent=Math.round(i.free_heap/1024)+' KB';
       document.getElementById('info-fw').textContent=i.firmware_version||'-';
+      function fmtUptime(s){if(s==null)return '-';var d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);
+        return (d?d+'d ':'')+(d||h?h+'h ':'')+m+'m '+(s%60)+'s';}
+      document.getElementById('info-uptime').textContent=fmtUptime(i.uptime_s);
+      document.getElementById('info-reset').textContent=i.reset_reason||'-';
       function rssiLabel(r){if(r==null)return '-';var q='';if(r>=-55)q=' (excellent)';else if(r>=-65)q=' (good)';else if(r>=-75)q=' (fair)';else q=' (poor)';return r+' dBm'+q;}
       document.getElementById('info-ssid').textContent=i.wifi_ssid||'-';
       document.getElementById('info-rssi').textContent=rssiLabel(i.wifi_rssi);

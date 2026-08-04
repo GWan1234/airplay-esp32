@@ -21,6 +21,7 @@
 #include "rtsp_server.h"
 #include "audio_output.h"
 #include "esp_app_desc.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -896,6 +897,33 @@ static esp_err_t ota_update_handler(httpd_req_t *req) {
   return ESP_OK;
 }
 
+static const char *reset_reason_str(esp_reset_reason_t r) {
+  switch (r) {
+  case ESP_RST_POWERON:
+    return "poweron";
+  case ESP_RST_EXT:
+    return "external";
+  case ESP_RST_SW:
+    return "software";
+  case ESP_RST_PANIC:
+    return "panic";
+  case ESP_RST_INT_WDT:
+    return "int_wdt";
+  case ESP_RST_TASK_WDT:
+    return "task_wdt";
+  case ESP_RST_WDT:
+    return "other_wdt";
+  case ESP_RST_DEEPSLEEP:
+    return "deepsleep";
+  case ESP_RST_BROWNOUT:
+    return "brownout";
+  case ESP_RST_SDIO:
+    return "sdio";
+  default:
+    return "unknown";
+  }
+}
+
 static esp_err_t system_info_handler(httpd_req_t *req) {
   cJSON *json = cJSON_CreateObject();
   cJSON *info = cJSON_CreateObject();
@@ -957,6 +985,10 @@ static esp_err_t system_info_handler(httpd_req_t *req) {
   }
   const esp_app_desc_t *app_desc = esp_app_get_description();
   cJSON_AddStringToObject(info, "firmware_version", app_desc->version);
+  cJSON_AddStringToObject(info, "reset_reason",
+                          reset_reason_str(esp_reset_reason()));
+  cJSON_AddNumberToObject(info, "uptime_s",
+                          (double)(esp_timer_get_time() / 1000000));
 #ifdef CONFIG_DAC_TAS58XX
   cJSON_AddBoolToObject(info, "eq_supported", true);
 #else
