@@ -24,6 +24,14 @@
 // TAS578x device ID register (Book 0, Page 0)
 #define TAS578x_REG_DEVICE_ID 0x67
 
+// Read-only status registers (Book 0, Page 0). See TAS5754M datasheet §8.4.2.
+#define TAS57XX_REG_PAGE         0x00
+#define TAS57XX_REG_ANALOG_MUTE  0x6C // ch A/B analogue mute monitor
+#define TAS57XX_REG_SHORT_DETECT 0x6D // line output short, live + sticky
+#define TAS57XX_REG_SPK_MUTE     0x72 // SPK_MUTE pin decoder (external UVP)
+#define TAS57XX_REG_POWER_STATE  0x75 // DSP boot done flag + power state
+#define TAS57XX_REG_AUTO_MUTE    0x78 // auto-mute flags
+
 #define I2C_TIMEOUT    100
 #define I2C_LINE_SPEED 100000
 
@@ -101,6 +109,11 @@ static const uint8_t tas575x_addrs[] = {TAS575x, 0x4D, 0x4E, 0x4F};
 static esp_err_t write_cmd(i2c_master_dev_handle_t handle, tas57xx_cmd_e cmd,
                            ...);
 static int tas57xx_detect_all(i2c_master_bus_handle_t bus);
+
+#if CONFIG_TAS57XX_FAULT_MONITOR
+static void tas57xx_monitor_task(void *arg);
+static TaskHandle_t s_monitor_task = NULL;
+#endif
 
 /**
  * Write a hybrid flow configuration byte stream to the DAC.
@@ -260,11 +273,27 @@ static esp_err_t tas57xx_init(void *i2c_bus) {
     }
   }
 
+#if CONFIG_TAS57XX_FAULT_MONITOR
+  if (s_monitor_task == NULL &&
+      xTaskCreate(tas57xx_monitor_task, "tas57xx_mon", 3072, NULL, 3,
+                  &s_monitor_task) != pdPASS) {
+    ESP_LOGW(TAG, "Failed to start fault monitor task");
+    s_monitor_task = NULL;
+  }
+#endif
+
   return err;
 }
 
 static esp_err_t tas57xx_deinit(void) {
   esp_err_t err = ESP_OK;
+
+#if CONFIG_TAS57XX_FAULT_MONITOR
+  if (s_monitor_task) {
+    vTaskDelete(s_monitor_task);
+    s_monitor_task = NULL;
+  }
+#endif
 
   for (int i = 0; i < s_dev_count; i++) {
     if (s_devs[i].handle) {
@@ -314,6 +343,155 @@ static void tas57xx_restore_config(void) {
   /* The init sequence parks the volume at -70 dB. */
   tas57xx_apply_volume_locked();
 }
+
+typedef struct {
+  uint8_t power_state;
+  uint8_t short_detect;
+  uint8_t auto_mute;
+  uint8_t analog_mute;
+  uint8_t spk_mute;
+  bool valid;
+} tas57xx_status_t;
+
+static const char *tas57xx_power_state_str(uint8_t state) {
+  switch (state) {
+  case 0x0:
+    return "powerdown";
+  case 0x1:
+    return "wait for CP voltage";
+  case 0x2:
+  case 0x3:
+    return "calibration";
+  case 0x4:
+    return "volume ramp up";
+  case 0x5:
+    return "run (playing)";
+  case 0x6:
+    return "output short / low impedance";
+  case 0x7:
+    return "volume ramp down";
+  case 0x8:
+    return "standby";
+  default:
+    return "unknown";
+  }
+}
+
+// Caller must hold s_dac_mutex.
+static esp_err_t tas57xx_read_status_locked(tas57xx_dev_t *d,
+                                            tas57xx_status_t *st) {
+  const uint8_t page0 = 0x00;
+  esp_err_t err =
+      board_i2c_write(d->handle, TAS57XX_REG_PAGE, &page0, sizeof(page0));
+  if (err != ESP_OK) {
+    return err;
+  }
+
+  const struct {
+    uint8_t reg;
+    uint8_t *dst;
+  } reads[] = {
+      {TAS57XX_REG_POWER_STATE, &st->power_state},
+      {TAS57XX_REG_SHORT_DETECT, &st->short_detect},
+      {TAS57XX_REG_AUTO_MUTE, &st->auto_mute},
+      {TAS57XX_REG_ANALOG_MUTE, &st->analog_mute},
+      {TAS57XX_REG_SPK_MUTE, &st->spk_mute},
+  };
+
+  for (size_t i = 0; i < sizeof(reads) / sizeof(reads[0]); i++) {
+    err = board_i2c_read(d->handle, reads[i].reg, reads[i].dst, 1);
+    if (err != ESP_OK) {
+      return err;
+    }
+  }
+
+  st->valid = true;
+  return ESP_OK;
+}
+
+static void tas57xx_report_status(const tas57xx_dev_t *d,
+                                  const tas57xx_status_t *st) {
+  // Analogue mute monitor is active low: 0 means the channel is muted.
+  ESP_LOGI(
+      TAG, "@0x%02X state=%s%s analog-mute=[%c%c] auto-mute=[%c%c] spk_mute=%u",
+      d->addr, tas57xx_power_state_str(st->power_state & 0x0F),
+      (st->power_state & 0x80) ? "" : " dsp-booting",
+      (st->analog_mute & 0x01) ? '-' : 'A',
+      (st->analog_mute & 0x02) ? '-' : 'B', (st->auto_mute & 0x01) ? 'A' : '-',
+      (st->auto_mute & 0x10) ? 'B' : '-', st->spk_mute & 0x03);
+}
+
+void dac_tas57xx_log_status(void) {
+  if (s_dac_mutex == NULL) {
+    ESP_LOGW(TAG, "Status unavailable, DAC not initialised");
+    return;
+  }
+
+  for (int i = 0; i < s_dev_count; i++) {
+    tas57xx_status_t st = {0};
+    xSemaphoreTake(s_dac_mutex, portMAX_DELAY);
+    esp_err_t err = tas57xx_read_status_locked(&s_devs[i], &st);
+    xSemaphoreGive(s_dac_mutex);
+
+    if (err != ESP_OK) {
+      ESP_LOGW(TAG, "@0x%02X status read failed: %s", s_devs[i].addr,
+               esp_err_to_name(err));
+      continue;
+    }
+    tas57xx_report_status(&s_devs[i], &st);
+  }
+}
+
+#if CONFIG_TAS57XX_FAULT_MONITOR
+static void tas57xx_monitor_task(void *arg) {
+  (void)arg;
+  tas57xx_status_t prev[TAS57XX_MAX_DEVICES] = {0};
+
+  while (true) {
+    vTaskDelay(pdMS_TO_TICKS(CONFIG_TAS57XX_FAULT_POLL_MS));
+
+    for (int i = 0; i < s_dev_count; i++) {
+      tas57xx_status_t st = {0};
+      xSemaphoreTake(s_dac_mutex, portMAX_DELAY);
+      esp_err_t err = tas57xx_read_status_locked(&s_devs[i], &st);
+      xSemaphoreGive(s_dac_mutex);
+
+      if (err != ESP_OK) {
+        ESP_LOGW(TAG, "@0x%02X status read failed: %s", s_devs[i].addr,
+                 esp_err_to_name(err));
+        prev[i].valid = false;
+        continue;
+      }
+
+      if (st.short_detect & 0x10) {
+        ESP_LOGE(TAG, "@0x%02X output shorted", s_devs[i].addr);
+      } else if (st.short_detect & 0x01) {
+        // Sticky bit, cleared by the read above.
+        ESP_LOGE(TAG, "@0x%02X output short since last poll", s_devs[i].addr);
+      }
+
+      // Over-temperature, over-current and DC-offset faults high-Z the output
+      // without any I2C flag, so infer them from leaving the run state.
+      if (prev[i].valid && s_power_state == DAC_POWER_ON &&
+          (prev[i].power_state & 0x0F) == 0x05 &&
+          (st.power_state & 0x0F) != 0x05) {
+        ESP_LOGE(TAG, "@0x%02X dropped out of run while playing -> %s",
+                 s_devs[i].addr,
+                 tas57xx_power_state_str(st.power_state & 0x0F));
+      }
+
+      if (!prev[i].valid || st.power_state != prev[i].power_state ||
+          st.auto_mute != prev[i].auto_mute ||
+          st.analog_mute != prev[i].analog_mute ||
+          st.spk_mute != prev[i].spk_mute) {
+        tas57xx_report_status(&s_devs[i], &st);
+      }
+
+      prev[i] = st;
+    }
+  }
+}
+#endif /* CONFIG_TAS57XX_FAULT_MONITOR */
 
 static void tas57xx_enable_speaker(bool enable) {
   for (int i = 0; i < s_dev_count; i++) {

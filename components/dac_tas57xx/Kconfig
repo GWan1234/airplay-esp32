@@ -9,4 +9,23 @@ if DAC_TAS57XX
             The TAS57xx register range is 0 dB to -127 dB.
             A value of -30 means AirPlay full volume maps to -30 dB on the DAC.
 
+    config TAS57XX_FAULT_MONITOR
+        bool "Poll and log amplifier fault status"
+        default n
+        help
+            Periodically read the TAS57xx read-only status registers over I2C
+            and log power-state transitions, output short detection, auto-mute
+            and SPK_MUTE (external undervoltage) events.
+
+            Useful for diagnosing intermittent audio loss on boards where the
+            SPK_FAULT pin is not wired to the ESP32, since over-temperature,
+            over-current and DC-offset faults are otherwise invisible to
+            software. Costs a few I2C reads per interval.
+
+    config TAS57XX_FAULT_POLL_MS
+        int "Fault poll interval (ms)"
+        depends on TAS57XX_FAULT_MONITOR
+        range 100 60000
+        default 1000
+
 endif # DAC_TAS57XX

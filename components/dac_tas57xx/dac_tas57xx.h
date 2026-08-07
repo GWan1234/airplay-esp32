@@ -25,3 +25,11 @@ float dac_tas57xx_get_sub_offset_db(void);
 
 /** Number of TAS57xx amplifiers detected. 0 before dac_init(). */
 int dac_tas57xx_get_device_count(void);
+
+/**
+ * Read and log the read-only status registers of every detected amplifier:
+ * power state, output short detection, auto-mute, analogue mute and the
+ * SPK_MUTE pin decoder. Useful on boards where SPK_FAULT is not wired to the
+ * ESP32. Safe to call before dac_init() (logs a warning and returns).
+ */
+void dac_tas57xx_log_status(void);
