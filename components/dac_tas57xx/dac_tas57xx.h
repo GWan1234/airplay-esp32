@@ -23,6 +23,27 @@ void dac_tas57xx_set_sub_offset_db(float offset_db);
 /** Get the current sub volume offset in dB. */
 float dac_tas57xx_get_sub_offset_db(void);
 
+/** Which input channel a bi-amp hybrid flow's mixer feeds both ways from. */
+typedef enum {
+  TAS57XX_INPUT_MIX = 0, /**< (L+R)/2 */
+  TAS57XX_INPUT_LEFT,
+  TAS57XX_INPUT_RIGHT,
+} tas57xx_input_src_t;
+
+/** True once a hybrid flow has been downloaded and is running. */
+bool dac_tas57xx_flow_active(void);
+
+/**
+ * Select the input channel a bi-amp hybrid flow mixes down to. The flow's two
+ * outputs are crossover ways rather than left and right, so this replaces the
+ * software channel selection rather than adding to it. Safe to call before
+ * dac_init(); the value is re-applied after every flow download.
+ */
+void dac_tas57xx_set_input_source(tas57xx_input_src_t src);
+
+/** Get the input channel a bi-amp hybrid flow is mixing down to. */
+tas57xx_input_src_t dac_tas57xx_get_input_source(void);
+
 /** Number of TAS57xx amplifiers detected. 0 before dac_init(). */
 int dac_tas57xx_get_device_count(void);
 

@@ -439,6 +439,7 @@ static esp_err_t channel_mode_get_handler(httpd_req_t *req) {
   cJSON *json = cJSON_CreateObject();
   cJSON_AddNumberToObject(json, "mode", audio_output_get_channel_mode());
   cJSON_AddBoolToObject(json, "locked", audio_output_channel_mode_locked());
+  cJSON_AddBoolToObject(json, "dsp", audio_output_channel_mode_in_dsp());
   cJSON_AddBoolToObject(json, "success", true);
   char *json_str = cJSON_Print(json);
   httpd_resp_set_type(req, "application/json");

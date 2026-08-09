@@ -68,7 +68,7 @@ input:focus{outline:none;border-color:#e94560}
 <button class='btn btn-secondary' onclick='saveBrightness()'>Save Brightness</button>
 <div id='brightness-msg'></div>
 <div id='chan-group'>
-<div class='form-group' style='margin-top:18px'><label for='chan-mode'>Output Channel</label>
+<div class='form-group' style='margin-top:18px'><label for='chan-mode' id='chan-label'>Output Channel</label>
 <select id='chan-mode' onchange='saveChannel()'>
 <option value='0'>Stereo</option>
 <option value='1'>Left only</option>
@@ -147,12 +147,23 @@ async function saveBrightness(){
 async function loadChannel(){
   try{var r=await fetch('/api/audio/channel');var d=await r.json();
     if(d.success){document.getElementById('chan-mode').value=String(d.mode);
-      chanLocked=!!d.locked;}}
+      chanLocked=!!d.locked;chanDsp=!!d.dsp;}}
   catch(e){console.warn('Could not load channel mode',e);}
+  applyChanLabels();
   applyAmpLayout();}
 var dualDevices=1;
 var dualMode=0;
 var chanLocked=false;
+var chanDsp=false;
+/* A bi-amp flow crosses the two outputs over into one speaker, so the choice
+   is which input channel to feed it — there is no stereo to pass through. */
+function applyChanLabels(){
+  document.getElementById('chan-label').textContent=
+    chanDsp?'Input Channel':'Output Channel';
+  var o=document.getElementById('chan-mode').options;
+  o[0].text=chanDsp?'Both (L+R)/2':'Stereo';
+  o[3].text=chanDsp?'Both (L+R)/2':'Mono (L+R)';
+}
 var DUAL_WARN={
   0:'Switch to 2.1 (Satellites / Sub)?\n\nThe second amplifier is reconfigured as PBTL mono: its OUT_A and OUT_B terminals must be bridged together and wired to a single subwoofer.\n\nRewire before restarting.',
   1:'Switch to Bi-Amp?\n\nBoth amplifiers run as stereo BTL, with OUT_A driving the woofer and OUT_B the tweeter of one speaker.\n\nIf OUT_A and OUT_B are still bridged for a PBTL subwoofer you MUST unbridge them first — leaving them shorted drives the two outputs against each other and can damage the amplifier and its output filters.'
