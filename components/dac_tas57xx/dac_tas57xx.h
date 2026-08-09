@@ -30,14 +30,19 @@ typedef enum {
   TAS57XX_INPUT_RIGHT,
 } tas57xx_input_src_t;
 
-/** True once a hybrid flow has been downloaded and is running. */
-bool dac_tas57xx_flow_active(void);
+/**
+ * True when a running hybrid flow carries a recognised bi-amp input mixer, and
+ * so makes the channel selection itself. False for any other flow — a sub
+ * low-pass or a full-range EQ uses that coefficient RAM for something else.
+ */
+bool dac_tas57xx_has_input_mix(void);
 
 /**
- * Select the input channel a bi-amp hybrid flow mixes down to. The flow's two
- * outputs are crossover ways rather than left and right, so this replaces the
- * software channel selection rather than adding to it. Safe to call before
- * dac_init(); the value is re-applied after every flow download.
+ * Select the input channel a bi-amp hybrid flow mixes down to. Ignored by any
+ * device whose flow has no input mixer. The flow's two outputs are crossover
+ * ways rather than left and right, so this replaces the software channel
+ * selection rather than adding to it. Safe to call before dac_init(); the
+ * value is re-applied after every flow download.
  */
 void dac_tas57xx_set_input_source(tas57xx_input_src_t src);
 

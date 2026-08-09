@@ -66,7 +66,7 @@ static volatile audio_channel_mode_t channel_mode = AUDIO_CHANNEL_STEREO;
  * selection instead, and the software downmix has to stand aside. */
 bool audio_output_channel_mode_in_dsp(void) {
 #ifdef CONFIG_DAC_TAS57XX
-  return dac_tas57xx_flow_active();
+  return dac_tas57xx_has_input_mix();
 #else
   return false;
 #endif

@@ -163,7 +163,8 @@ typedef struct {
   i2c_master_dev_handle_t handle; // per-device I2C handle
   uint8_t *hf_buf;                // cached hybrid flow (NULL if none)
   long hf_size;
-  bool is_sub; // true for index > 0 (sub / .1 channel)
+  bool is_sub;        // true for index > 0 (sub / .1 channel)
+  bool has_input_mix; // flow carries a recognised bi-amp input mixer
 } tas57xx_dev_t;
 
 static tas57xx_dev_t s_devs[TAS57XX_MAX_DEVICES];
@@ -309,6 +310,76 @@ static esp_err_t tas57xx_write_hf(i2c_master_dev_handle_t handle,
   return ESP_OK;
 }
 
+// The three gain pairs a bi-amp flow's input mixer is ever authored with,
+// indexed by tas57xx_input_src_t.
+static const uint8_t tas57xx_input_coeff[][TAS57XX_INPUT_MIX_LEN] = {
+    [TAS57XX_INPUT_MIX] = {0x40, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00},
+    [TAS57XX_INPUT_LEFT] = {0x7F, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x00},
+    [TAS57XX_INPUT_RIGHT] = {0x00, 0x00, 0x00, 0x00, 0x7F, 0xFF, 0xFF, 0x00},
+};
+
+static const uint8_t tas57xx_input_slots[] = {TAS57XX_REG_INPUT_MIX_A,
+                                              TAS57XX_REG_INPUT_MIX_B};
+
+/**
+ * Decide whether a flow is a bi-amp mixer flow, by replaying its writes into a
+ * shadow of the two input-mixer slots and checking what it leaves there. Only
+ * a flow that feeds both crossover ways from one channel-select mixer puts a
+ * recognised gain pair in both; anything else — a sub low-pass, a full-range
+ * EQ — uses that coefficient RAM for something we must not overwrite.
+ *
+ * The shadow starts zeroed because the download is preceded by a module reset,
+ * which clears coefficient RAM. That matters: a flow converted from a PPC2
+ * snapshot writes only the non-zero bytes, one at a time, and relies on the
+ * reset for the rest.
+ */
+static bool tas57xx_flow_has_input_mix(const uint8_t *stream) {
+  uint8_t shadow[sizeof(tas57xx_input_slots)][TAS57XX_INPUT_MIX_LEN] = {{0}};
+  bool touched[sizeof(tas57xx_input_slots)] = {false};
+  int pos = 0;
+  uint8_t page = 0;
+
+  while (!(stream[pos] == 0xFF && stream[pos + 1] == 0xFF)) {
+    uint8_t reg = stream[pos];
+    uint8_t len = stream[pos + 1];
+    const uint8_t *data = &stream[pos + 2];
+
+    if (page == TAS57XX_PAGE_INPUT_MIX) {
+      for (size_t i = 0; i < sizeof(tas57xx_input_slots); i++) {
+        uint8_t slot = tas57xx_input_slots[i];
+        for (int k = 0; k < TAS57XX_INPUT_MIX_LEN; k++) {
+          int off = slot + k - reg;
+          if (off >= 0 && off < len) {
+            shadow[i][k] = data[off];
+            touched[i] = true;
+          }
+        }
+      }
+    }
+    if (reg == TAS57XX_REG_PAGE && len == 1) {
+      page = data[0];
+    }
+    pos += 2 + len;
+  }
+
+  for (size_t i = 0; i < sizeof(tas57xx_input_slots); i++) {
+    if (!touched[i]) {
+      return false;
+    }
+    bool known = false;
+    size_t n_coeff =
+        sizeof(tas57xx_input_coeff) / sizeof(tas57xx_input_coeff[0]);
+    for (size_t k = 0; !known && k < n_coeff; k++) {
+      known =
+          memcmp(shadow[i], tas57xx_input_coeff[k], TAS57XX_INPUT_MIX_LEN) == 0;
+    }
+    if (!known) {
+      return false;
+    }
+  }
+  return true;
+}
+
 /**
  * Point a bi-amp flow's input mixer at the left channel, the right channel or
  * their average. Coefficient RAM is double buffered, so each slot is written
@@ -316,23 +387,20 @@ static esp_err_t tas57xx_write_hf(i2c_master_dev_handle_t handle,
  * again — otherwise the change would be undone by the next swap.
  */
 static void tas57xx_write_input_mix(tas57xx_dev_t *d) {
-  static const uint8_t coeff[][TAS57XX_INPUT_MIX_LEN] = {
-      [TAS57XX_INPUT_MIX] = {0x40, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00},
-      [TAS57XX_INPUT_LEFT] = {0x7F, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x00},
-      [TAS57XX_INPUT_RIGHT] = {0x00, 0x00, 0x00, 0x00, 0x7F, 0xFF, 0xFF, 0x00},
-  };
-  static const uint8_t slots[] = {TAS57XX_REG_INPUT_MIX_A,
-                                  TAS57XX_REG_INPUT_MIX_B};
+  if (!d->has_input_mix) {
+    return;
+  }
+
   const uint8_t page_mix = TAS57XX_PAGE_INPUT_MIX;
   const uint8_t page_cram = TAS57XX_PAGE_CRAM_CTRL;
   const uint8_t page0 = 0x00;
   const uint8_t swap = TAS57XX_CRAM_ADAPTIVE | TAS57XX_CRAM_SWITCH;
-  const uint8_t *val = coeff[s_input_src];
+  const uint8_t *val = tas57xx_input_coeff[s_input_src];
 
-  for (size_t i = 0; i < sizeof(slots); i++) {
+  for (size_t i = 0; i < sizeof(tas57xx_input_slots); i++) {
     for (int bank = 0; bank < 2; bank++) {
       board_i2c_write(d->handle, TAS57XX_REG_PAGE, &page_mix, sizeof(page_mix));
-      board_i2c_write(d->handle, (uint8_t)(slots[i] | 0x80), val,
+      board_i2c_write(d->handle, (uint8_t)(tas57xx_input_slots[i] | 0x80), val,
                       TAS57XX_INPUT_MIX_LEN);
       if (bank == 0) {
         board_i2c_write(d->handle, TAS57XX_REG_PAGE, &page_cram,
@@ -530,6 +598,9 @@ static void tas57xx_program_device(tas57xx_dev_t *d) {
   if (download) {
     s_flow_resident = true;
     tas57xx_verify_hf(d);
+    d->has_input_mix = tas57xx_flow_has_input_mix(d->hf_buf);
+    ESP_LOGI(TAG, "@0x%02X flow input mixer: %s", d->addr,
+             d->has_input_mix ? "present, channel selectable" : "not present");
     // A flow carries whichever input channel it was authored with.
     tas57xx_write_input_mix(d);
   }
@@ -971,6 +1042,7 @@ static void tas57xx_set_power_mode(dac_power_mode_t mode) {
   case DAC_POWER_OFF:
     s_flow_resident = false; // powerdown wipes the miniDSP RAM
     for (int i = 0; i < s_dev_count; i++) {
+      s_devs[i].has_input_mix = false;
       write_cmd(s_devs[i].handle, TAS57XX_MUTE);
       write_cmd(s_devs[i].handle, TAS57XX_DOWN);
     }
@@ -1115,8 +1187,13 @@ float dac_tas57xx_get_sub_offset_db(void) {
   return s_sub_offset_db;
 }
 
-bool dac_tas57xx_flow_active(void) {
-  return s_flow_resident;
+bool dac_tas57xx_has_input_mix(void) {
+  for (int i = 0; i < s_dev_count; i++) {
+    if (s_devs[i].has_input_mix) {
+      return true;
+    }
+  }
+  return false;
 }
 
 void dac_tas57xx_set_input_source(tas57xx_input_src_t src) {
@@ -1133,10 +1210,8 @@ void dac_tas57xx_set_input_source(tas57xx_input_src_t src) {
 
   xSemaphoreTake(s_dac_mutex, portMAX_DELAY);
   s_input_src = src;
-  if (s_flow_resident) {
-    for (int i = 0; i < s_dev_count; i++) {
-      tas57xx_write_input_mix(&s_devs[i]);
-    }
+  for (int i = 0; i < s_dev_count; i++) {
+    tas57xx_write_input_mix(&s_devs[i]);
   }
   xSemaphoreGive(s_dac_mutex);
   ESP_LOGI(TAG, "Flow input source: %s",
