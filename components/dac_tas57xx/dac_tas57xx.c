@@ -667,11 +667,16 @@ static void tas57xx_load_hf(int i, bool multi) {
              "No HF for sub @0x%02X — running full-range BTL (no crossover). "
              "Provide a mono low-pass flow as /spiffs/hf/tas57xx_fw%d.bin.",
              d->addr, i);
-  } else {
+  } else if (multi) {
+    // A second amp is only fitted for a crossover, so a mains without one is
+    // a misconfiguration rather than a plain stereo board.
     ESP_LOGW(TAG,
-             "No HF at %s — @0x%02X runs the built-in stereo flow (no "
-             "crossover, EQ or routing)",
+             "No HF at %s — mains @0x%02X runs the built-in stereo flow while "
+             "a sub is fitted",
              path, d->addr);
+  } else {
+    ESP_LOGI(TAG, "No HF at %s — @0x%02X runs the built-in stereo flow", path,
+             d->addr);
   }
 }
 
