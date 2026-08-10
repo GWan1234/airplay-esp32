@@ -153,6 +153,7 @@ async function loadChannel(){
   applyAmpLayout();}
 var dualDevices=1;
 var dualMode=0;
+var dualLoaded=false;
 var chanLocked=false;
 var chanDsp=false;
 /* A bi-amp flow crosses the two outputs over into one speaker, so the choice
@@ -240,10 +241,13 @@ async function loadInfo(){
       document.getElementById('info-phy').textContent=i.wifi_phy||'-';
       document.getElementById('info-bssid').textContent=i.wifi_bssid||'-';
       if(i.eq_supported||i.sub_supported){document.getElementById('eq-link').style.display='';}
+      /* Only a TAS58xx build registers /api/audio/dual; asking anyway logs a
+         warning on the device for every page load. */
+      if(i.dual_supported&&!dualLoaded){dualLoaded=true;loadDual();}
       document.getElementById('dev-name').placeholder=i.device_name||'';}}catch(e){}}
 window.onload=function(){
   document.getElementById('fw-file').onchange=function(e){var f=e.target.files[0];
     document.getElementById('fw-name').textContent=f?f.name:'No file selected';
     document.getElementById('ota-btn').disabled=!f;};
-  loadInfo();loadBrightness();loadChannel();loadDual();setInterval(loadInfo,30000);};
+  loadInfo();loadBrightness();loadChannel();setInterval(loadInfo,30000);};
 </script></body></html>

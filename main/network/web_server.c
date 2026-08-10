@@ -1000,6 +1000,11 @@ static esp_err_t system_info_handler(httpd_req_t *req) {
 #else
   cJSON_AddBoolToObject(info, "sub_supported", false);
 #endif
+#ifdef CONFIG_DAC_TAS58XX
+  cJSON_AddBoolToObject(info, "dual_supported", true);
+#else
+  cJSON_AddBoolToObject(info, "dual_supported", false);
+#endif
 
   cJSON_AddItemToObject(json, "info", info);
   cJSON_AddBoolToObject(json, "success", true);
