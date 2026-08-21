@@ -1,8 +1,28 @@
 #pragma once
 
+#include <stdbool.h>
+#include <stdint.h>
+
 #include "esp_err.h"
 
 #include "freertos/FreeRTOS.h"
+
+/**
+ * Priority of the playback task in every output backend.
+ *
+ * It MUST outrank every audio source task (realtime UDP receiver = 8,
+ * control receiver = 7, buffered TCP reader = 5) because the source tasks
+ * are pinned to the same core.  A source task that outranks playback starves
+ * it during a receive burst; the DMA ring (~46 ms) then runs dry and
+ * auto_clear emits silence, so wall-clock advances while no audio is
+ * consumed and the playout position slips permanently late.  That was the
+ * mechanism behind the realtime-stream drift in issue #122 — the buffered
+ * path was unaffected only because its reader task sits at priority 5.
+ *
+ * Playback cannot starve the sources in return: it blocks on the DMA write
+ * for all but a few hundred microseconds of each ~8 ms frame period.
+ */
+#define AUDIO_PLAYBACK_TASK_PRIORITY 9
 
 /**
  * Output channel mode. LEFT/RIGHT route the chosen source channel to both
@@ -72,6 +92,36 @@ void audio_output_set_source_rate(int rate);
  * stays correct if the DMA config or sample rate is ever changed.
  */
 uint32_t audio_output_get_hardware_latency_us(void);
+
+/**
+ * Sample the live output pipeline delay: how long from now until the first
+ * sample of the NEXT backend write is heard.
+ *
+ * Unlike audio_output_get_hardware_latency_us(), which models a permanently
+ * half-full DMA ring, this reports the measured queue depth (frames handed
+ * to the hardware minus frames the hardware reports as clocked out).  The
+ * measurement is what makes the timing engine's error signal honest:
+ *
+ *   - it is unaffected by when the playback task happens to be scheduled,
+ *     removing the one-sided "late read" noise the model suffers from;
+ *   - after a writer stall it correctly reports a near-empty ring, so the
+ *     engine sees the real lateness of the content it is about to submit
+ *     instead of a fixed 43 ms guess.
+ *
+ * @param now_us      out: esp_timer_get_time() sampled with the queue depth.
+ * @param pipeline_us out: queue depth in microseconds at the output rate.
+ * @return false if the backend cannot report a hardware completion cursor,
+ *         in which case the caller should fall back to the modelled latency.
+ */
+bool audio_output_get_pipeline_us(int64_t *now_us, uint32_t *pipeline_us);
+
+/**
+ * Number of output-underrun episodes since boot: the DMA clocked out
+ * descriptors the playback task never filled, so that much output time was
+ * emitted as silence and lost from the playout position.  Non-zero values
+ * mean the playback task is being starved.
+ */
+uint32_t audio_output_get_underruns(void);
 
 /**
  * Cycle the output channel mode: STEREO -> LEFT -> RIGHT -> MONO -> STEREO.

@@ -185,16 +185,36 @@ static bool compute_early_us(const audio_timing_t *timing,
     break;
   }
 
-  // Subtract hardware latency to account for I2S DMA delay
-  // and pipeline latency for task scheduling and write blocking.
-  // The hardware latency is computed from the DMA descriptor/frame
-  // configuration rather than being hard-coded.
-  target_ns -=
-      (int64_t)(audio_output_get_hardware_latency_us() + PIPELINE_LATENCY_US) *
-      1000LL;
+  // Subtract the output pipeline delay: the time between this call handing a
+  // sample to the backend and that sample leaving the DAC.
+  //
+  // Prefer the LIVE measurement (frames accepted by the hardware minus frames
+  // the hardware reports as clocked out).  The modelled constant is only a
+  // fallback for backends without a completion cursor, and it is wrong in the
+  // two situations that matter:
+  //
+  //   - it assumes the ring is always at its steady-state occupancy, so when
+  //     the playback task is briefly starved the read happens late against a
+  //     ring that is emptier than modelled and the error reads far more
+  //     negative than reality (the one-sided noise the position servo's
+  //     innovation clamp was added to survive);
+  //   - after a real underrun the ring is dry, so the next sample is heard
+  //     almost immediately rather than ~43 ms later.  With the model the
+  //     engine cannot tell the difference and the lost output time is never
+  //     recovered — the mechanism behind the drift in issue #122.
+  //
+  // The live depth is self-consistent while the ring refills: each frame
+  // consumed adds its own duration to the queue, so the measured error stays
+  // put instead of walking, and no extra frames are dropped during recovery.
+  int64_t now_us = 0;
+  uint32_t pipeline_us = 0;
+  if (!audio_output_get_pipeline_us(&now_us, &pipeline_us)) {
+    now_us = esp_timer_get_time();
+    pipeline_us = audio_output_get_hardware_latency_us();
+  }
+  target_ns -= (int64_t)(pipeline_us + PIPELINE_LATENCY_US) * 1000LL;
 
-  int64_t now_ns = (int64_t)esp_timer_get_time() * 1000LL;
-  *early_us = (target_ns - now_ns) / 1000LL;
+  *early_us = (target_ns / 1000LL) - now_us;
 
   return true;
 }
@@ -436,13 +456,12 @@ size_t audio_timing_read(audio_timing_t *timing, audio_buffer_t *buffer,
   enum { MAX_DRAIN_ATTEMPTS = 64 };
   const int64_t drain_deadline_us = esp_timer_get_time() + 1500;
   // Set when the drain loop below discards at least one late frame in this
-  // call.  After a drop run, the stream is re-locking onto a new position:
-  // the next playable frame must meet the strict (half frame period) release
-  // rather than the wide jitter threshold, otherwise a discontinuity in the
-  // RTP sequence re-starts playback up to threshold_us early and the bias
-  // persists (observed on hardware: a WiFi stall dropped ~9 frames and left
-  // err parked at +20..31 ms for the rest of the session).
-  bool dropped_late = false;
+  // call, or when a previous call left a drop run unfinished.  A drop run
+  // re-locks the stream onto a new position, so both the release point for
+  // the next playable frame and the point at which dropping stops tighten
+  // from the wide jitter threshold to half a frame period — see the gate
+  // below.
+  bool dropped_late = timing->late_drop_active;
   // Stale start-island frames skipped in this call (see the check below).
   int start_skips = 0;
   for (int attempt = 0; attempt < MAX_DRAIN_ATTEMPTS; attempt++) {
@@ -586,21 +605,18 @@ size_t audio_timing_read(audio_timing_t *timing, audio_buffer_t *buffer,
       }
     }
 
-    // RTP continuity vs the frame just played.  A fresh frame exactly at
-    // expected_rtp is contiguous audio: it can never legitimately need
-    // holding (its schedule slot begins the instant the previous frame
-    // ends), so it bypasses the early-hold entirely — measurement noise can
-    // then never insert silence into an unbroken stream.  A fresh frame
-    // ABOVE expected_rtp means packets were lost and not recovered by the
-    // resend mechanism: conceal the hole by holding the frame to the strict
+    // RTP continuity vs the frame just played.  A fresh frame ABOVE
+    // expected_rtp means packets were lost and not recovered by the resend
+    // mechanism: conceal the hole by holding the frame to the strict
     // release, so exactly gap-length silence plays at the right schedule.
     // Without this, the post-gap frame (typically ~8 ms early, far inside
     // the 50 ms realtime threshold) played immediately — an audible skip
     // AND a permanent early shift of the whole playback position for every
-    // unrecovered packet.  Below expected_rtp (duplicate/overlap from a
-    // redundant resend) is treated as continuous: playing it repeats at
-    // most one frame, which keeps the stream moving.
-    bool continuous = false;
+    // unrecovered packet.  At or below expected_rtp is contiguous audio (or
+    // a duplicate from a redundant resend, which is played because repeating
+    // at most one frame keeps the stream moving); its schedule slot begins
+    // the instant the previous frame ends, so it is normally released
+    // straight away by the wide threshold below.
     bool gap = false;
     if (!from_pending && timing->playout_started &&
         timing->expected_rtp_valid) {
@@ -624,8 +640,6 @@ size_t audio_timing_read(audio_timing_t *timing, audio_buffer_t *buffer,
         } else {
           timing->gaps_suppressed++;
         }
-      } else {
-        continuous = true;
       }
     }
 
@@ -647,10 +661,36 @@ size_t audio_timing_read(audio_timing_t *timing, audio_buffer_t *buffer,
         // precisely instead of anywhere inside the wide threshold.
         int64_t frame_period_us =
             ((int64_t)frame_samples * 1000000LL) / format->sample_rate;
+        int64_t strict_us = frame_period_us / 2;
         int64_t release_us = (from_pending || dropped_late || gap)
-                                 ? frame_period_us / 2
+                                 ? strict_us
                                  : timing_threshold_us;
-        if (!continuous && early_us > release_us) {
+
+        // Late gate, with hysteresis.  Lateness beyond the wide threshold
+        // STARTS a drop run; once started, frames keep being dropped until
+        // the stream is back on schedule rather than until it is merely
+        // inside the threshold again.
+        //
+        // Stopping at the threshold is what left the realtime path parked at
+        // err = -(threshold - one drain overshoot) for the rest of a session
+        // and made the drop path the sole regulator of queue depth (issue
+        // #122): every disturbance walked the position later, the drain
+        // clawed back just enough to re-enter the threshold, and the standing
+        // offset survived because the position servo's 710 ppm of authority
+        // needs ~11 minutes to remove 470 ms.  Draining to the strict window
+        // instead makes err ≈ 0 the equilibrium, so the servo only ever has
+        // to handle crystal drift — which is what it was designed for.
+        int64_t late_limit_us =
+            dropped_late ? -strict_us : -timing_threshold_us;
+
+        // A contiguous frame is no longer exempt from the early gate.  It
+        // used to bypass it entirely so that measurement noise could not
+        // insert silence into an unbroken stream, but that also meant a
+        // forward anchor jump mid-stream was never corrected.  Now that
+        // compute_early_us() measures the live output queue instead of
+        // modelling it, the residual noise is a fraction of a DMA descriptor
+        // (~±3 ms) and cannot reach the 25/50 ms threshold.
+        if (early_us > release_us) {
           // Only advance the stuck-anchor counter for NEW frames taken from
           // the buffer — not for pending re-checks of the same early frame.
           // A pending frame is re-examined every DMA callback (~8 ms) while
@@ -722,7 +762,7 @@ size_t audio_timing_read(audio_timing_t *timing, audio_buffer_t *buffer,
                    frame_samples * AUDIO_OUT_CHANNELS * sizeof(int16_t));
             return frame_samples;
           }
-        } else if (early_us < -timing_threshold_us) {
+        } else if (early_us < late_limit_us) {
           // Reset consecutive early counter on late/normal frames
           timing->consecutive_early_frames = 0;
 
@@ -797,13 +837,17 @@ size_t audio_timing_read(audio_timing_t *timing, audio_buffer_t *buffer,
           ptp_clock_get_stats(&ps);
           int64_t ptp_gap_us =
               (ps.last_offset_ns - ps.filtered_offset_ns) / 1000LL;
+          // under: output underruns since boot.  Any increase means the
+          // playback task was starved long enough for the DMA ring to run
+          // dry, which is the disturbance the drain has to clean up after.
           ESP_LOGI(TAG,
                    "Playout: err=%lld ms buffered=%d depth=%lld ms "
                    "ptp_gap=%lld us outliers=%" PRIu32 " gaps=%" PRIu32
-                   " rtp=%" PRIu32,
+                   " under=%" PRIu32 " rtp=%" PRIu32,
                    (long long)(on_time_err_us / 1000LL), buffered_frames,
                    (long long)depth_ms, (long long)ptp_gap_us, ps.outlier_count,
-                   timing->gaps, played_rtp_timestamp);
+                   timing->gaps, audio_output_get_underruns(),
+                   played_rtp_timestamp);
         }
 
         // Position servo (see POS_SERVO_* above).  Smooth the per-frame
