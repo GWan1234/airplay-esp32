@@ -328,8 +328,8 @@ esp_err_t audio_output_init(void) {
 }
 
 void audio_output_start(void) {
-  xTaskCreatePinnedToCore(playback_task, "spdif_play", 4096, NULL, 7, NULL,
-                          PLAYBACK_CORE);
+  xTaskCreatePinnedToCore(playback_task, "spdif_play", 4096, NULL,
+                          AUDIO_PLAYBACK_TASK_PRIORITY, NULL, PLAYBACK_CORE);
 }
 
 void audio_output_flush(void) {
@@ -348,4 +348,16 @@ uint32_t audio_output_get_hardware_latency_us(void) {
   // audio samples (= 96 stereo frames per buffer).
   const uint32_t audio_samples = DMA_BUF_COUNT * (SPDIF_BLOCK / SPDIF_BUF_DIV);
   return (uint32_t)((uint64_t)audio_samples * 1000000ULL / OUTPUT_RATE);
+}
+
+/* The BMC-encoded write path has no hardware completion cursor, so the timing
+ * engine falls back to the modelled ring latency above. */
+bool audio_output_get_pipeline_us(int64_t *now_us, uint32_t *pipeline_us) {
+  (void)now_us;
+  (void)pipeline_us;
+  return false;
+}
+
+uint32_t audio_output_get_underruns(void) {
+  return 0;
 }
