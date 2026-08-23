@@ -2,9 +2,17 @@
 .claude/
 .pio/
 .venv/
+.venv-zensical/
 .vscode/
-build*
-!.github/workflows/build.yml
+# Anchored to the repo root — an unanchored "build*" also swallows files like
+# docs/reference/build-environments.md and .github/workflows/build.yml.
+/build*
+
+# Documentation site output
+/site/
+
+# Local tooling artifacts (screenshots, browser traces)
+/output/
 managed_components/
 sdkconfig
 sdkconfig.*
