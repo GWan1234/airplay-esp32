@@ -99,6 +99,25 @@ esp_err_t settings_get_device_name(char *name, size_t len);
  */
 esp_err_t settings_set_device_name(const char *name);
 
+/**
+ * Derive a DNS/DHCP-safe hostname from a device name.
+ *
+ * Host names are restricted to ASCII letters, digits and hyphens (RFC 1123),
+ * so the UTF-8 device name cannot be used verbatim. Alphanumerics are kept,
+ * every other byte collapses into a single hyphen, and the result is
+ * truncated to fit @p len. Names with no usable ASCII (for example Cyrillic
+ * or CJK) fall back to "esp32-airplay-<mac>", which stays unique per device.
+ *
+ * The device name itself must keep its original UTF-8 form wherever it is
+ * shown to the user (mDNS service instance names, AirPlay metadata).
+ *
+ * @param name    Device name (UTF-8, may be NULL)
+ * @param out     Output buffer for the hostname
+ * @param out_len Size of @p out, must be at least 2
+ */
+void settings_device_name_to_hostname(const char *name, char *out,
+                                      size_t out_len);
+
 // ---- LED settings ----
 
 /**
