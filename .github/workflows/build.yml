@@ -32,6 +32,9 @@ jobs:
           - name: smartamp
             target: esp32
             sdkconfig: "sdkconfig.defaults;sdkconfig.defaults.bt;sdkconfig.defaults.smartamp"
+          - name: esparagus-louder-s3
+            target: esp32s3
+            sdkconfig: "sdkconfig.defaults;sdkconfig.defaults.esparagus-louder-s3"
     steps:
       - uses: actions/checkout@v6
         with:
