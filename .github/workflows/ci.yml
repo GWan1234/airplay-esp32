@@ -64,6 +64,34 @@ jobs:
           fi
           echo "All files pass clang-tidy checks"
 
+  # The release matrix in build.yml only covers I2S/DAC boards, so a backend
+  # that misses part of the audio_output API links fine there and breaks only
+  # for whoever selects it. These configurations ship no firmware artifact;
+  # they exist to keep every backend linking.
+  output-backends:
+    needs: [format-check, lint-check]
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - name: spdif
+            target: esp32s3
+            sdkconfig: "sdkconfig.defaults;sdkconfig.defaults.esp32s3;sdkconfig.defaults.spdif"
+          - name: usb
+            target: esp32s3
+            sdkconfig: "sdkconfig.defaults;sdkconfig.defaults.esp32s3;sdkconfig.defaults.usb"
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: "recursive"
+
+      - name: Build ${{ matrix.name }} output backend
+        uses: espressif/esp-idf-ci-action@v1
+        with:
+          esp_idf_version: v5.5
+          target: ${{ matrix.target }}
+          command: idf.py -DSDKCONFIG_DEFAULTS="${{ matrix.sdkconfig }}" build
+
   build:
     needs: [format-check, lint-check]
     uses: ./.github/workflows/build.yml
