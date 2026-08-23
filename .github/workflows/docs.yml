@@ -7,12 +7,12 @@ on:
       - "docs/**"
       - "mkdocs.yml"
       - ".github/workflows/docs.yml"
+  # Unfiltered, unlike push above, because docs-build is a required check and a
+  # required check whose workflow never triggers blocks the merge. It is a
+  # twenty-second build, and running it everywhere also catches a firmware
+  # change that invalidates a link in the docs.
   pull_request:
     branches: [main]
-    paths:
-      - "docs/**"
-      - "mkdocs.yml"
-      - ".github/workflows/docs.yml"
   # Republish after a release so the browser installer picks up new binaries.
   release:
     types: [published]
@@ -26,7 +26,9 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  build:
+  # Not just "build": the CI workflow has a job by that name too, and two status
+  # checks sharing a context name are ambiguous to reference in a ruleset.
+  docs-build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -85,7 +87,7 @@ jobs:
 
   deploy:
     if: github.event_name != 'pull_request'
-    needs: build
+    needs: docs-build
     runs-on: ubuntu-latest
     permissions:
       pages: write
