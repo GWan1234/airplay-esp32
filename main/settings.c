@@ -2,7 +2,9 @@
 
 #include "dac.h"
 #include "esp_log.h"
+#include "esp_mac.h"
 #include "nvs.h"
+#include <stdio.h>
 #include <string.h>
 
 static const char *TAG = "settings";
@@ -316,6 +318,39 @@ esp_err_t settings_set_device_name(const char *name) {
   }
 
   return err;
+}
+
+void settings_device_name_to_hostname(const char *name, char *out,
+                                      size_t out_len) {
+  if (!out || out_len < 2) {
+    return;
+  }
+
+  size_t j = 0;
+  for (size_t i = 0; name && name[i] && j < out_len - 1; i++) {
+    char c = name[i];
+    if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+        (c >= '0' && c <= '9')) {
+      out[j++] = c;
+    } else if (j > 0 && out[j - 1] != '-') {
+      out[j++] = '-';
+    }
+  }
+  while (j > 0 && out[j - 1] == '-') {
+    j--;
+  }
+
+  if (j == 0) {
+    // No ASCII survived (e.g. an all-Cyrillic name). Suffix the MAC so two
+    // such devices do not both answer to the same hostname.
+    uint8_t mac[6] = {0};
+    esp_read_mac(mac, ESP_MAC_WIFI_STA);
+    snprintf(out, out_len, "esp32-airplay-%02x%02x%02x", mac[3], mac[4],
+             mac[5]);
+    return;
+  }
+
+  out[j] = '\0';
 }
 
 /* ================================================================== */

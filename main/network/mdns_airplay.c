@@ -12,6 +12,10 @@
 
 static const char *TAG = "mdns_airplay";
 
+// Longest single DNS label (RFC 1035). The mDNS component caps names at
+// MDNS_NAME_MAX_LEN, which is never smaller than this.
+#define MDNS_HOSTNAME_MAX_LEN 63
+
 // Feature flags are defined in rtsp_handlers.h (shared with /info handler)
 
 // Protocol version
@@ -48,9 +52,13 @@ void mdns_airplay_init(void) {
   char service_name[80];
   char pk_str[65]; // 32 bytes = 64 hex chars + null
   char device_name[65];
+  char hostname[MDNS_HOSTNAME_MAX_LEN + 1];
 
-  // Get device name from settings
+  // Get device name from settings. This is the user-facing name and stays
+  // UTF-8 for the service instance names below; only the hostname is
+  // restricted to ASCII.
   settings_get_device_name(device_name, sizeof(device_name));
+  settings_device_name_to_hostname(device_name, hostname, sizeof(hostname));
 
   // Get MAC address
   wifi_get_mac_str(mac_str, sizeof(mac_str));
@@ -75,8 +83,16 @@ void mdns_airplay_init(void) {
   // Initialize mDNS
   ESP_ERROR_CHECK(mdns_init());
 
-  // Set hostname
-  ESP_ERROR_CHECK(mdns_hostname_set(device_name));
+  // Set hostname. A bad name must not panic the device, so this is logged
+  // like the service registrations below rather than ESP_ERROR_CHECK'd.
+  esp_err_t err_host = mdns_hostname_set(hostname);
+  if (err_host != ESP_OK) {
+    ESP_LOGE(TAG, "Failed to set mDNS hostname '%s': %s", hostname,
+             esp_err_to_name(err_host));
+  } else {
+    ESP_LOGI(TAG, "mDNS hostname: %s.local (device name: %s)", hostname,
+             device_name);
+  }
 
 #ifndef CONFIG_AIRPLAY_FORCE_V1
   // ========================================

@@ -203,24 +203,7 @@ void ethernet_set_hostname(const char *device_name) {
     return;
   }
   char hostname[DHCP_HOSTNAME_MAX_LEN + 1];
-  size_t j = 0;
-  for (size_t i = 0; device_name[i] && j < sizeof(hostname) - 1; i++) {
-    char c = device_name[i];
-    if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-        (c >= '0' && c <= '9')) {
-      hostname[j++] = c;
-    } else if (j > 0 && hostname[j - 1] != '-') {
-      hostname[j++] = '-';
-    }
-  }
-  while (j > 0 && hostname[j - 1] == '-') {
-    j--;
-  }
-  if (j == 0) {
-    strlcpy(hostname, "esp32-airplay", sizeof(hostname));
-  } else {
-    hostname[j] = '\0';
-  }
+  settings_device_name_to_hostname(device_name, hostname, sizeof(hostname));
   esp_err_t err = esp_netif_set_hostname(s_eth_netif, hostname);
   if (err != ESP_OK) {
     ESP_LOGE(TAG, "Failed to set hostname '%s': %s", hostname,
