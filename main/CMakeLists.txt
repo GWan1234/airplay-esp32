@@ -45,7 +45,10 @@ set( SRC_FILES
     "dacp_client.c"
 )
 
-# Select audio output implementation at compile time
+# Select audio output implementation at compile time. audio_output_common.c
+# carries weak defaults for the optional entry points, so a backend only has
+# to implement what it actually supports.
+list(APPEND SRC_FILES "audio/audio_output_common.c")
 if(CONFIG_AUDIO_OUTPUT_SPDIF)
     list(APPEND SRC_FILES "audio/audio_output_spdif.c")
 elseif(CONFIG_AUDIO_OUTPUT_USB)

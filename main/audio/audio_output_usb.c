@@ -214,14 +214,6 @@ uint32_t audio_output_get_hardware_latency_us(void) {
   return 2000;
 }
 
-/* The UAC driver does not expose a transfer-completion cursor, so the timing
- * engine falls back to the fixed endpoint latency above. */
-bool audio_output_get_pipeline_us(int64_t *now_us, uint32_t *pipeline_us) {
-  (void)now_us;
-  (void)pipeline_us;
-  return false;
-}
-
-uint32_t audio_output_get_underruns(void) {
-  return 0;
-}
+/* The UAC driver exposes neither a transfer-completion cursor nor an underrun
+ * count, and there is no channel routing to control, so the weak defaults in
+ * audio_output_common.c cover the rest of the API. */
