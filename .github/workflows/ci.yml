@@ -39,7 +39,7 @@ jobs:
         with:
           esp_idf_version: v5.5
           target: esp32s3
-          command: idf.py -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.esp32s3" build
+          command: idf.py -DSDKCONFIG_DEFAULTS="config/sdkconfig.defaults;config/sdkconfig.defaults.esp32s3" build
 
       - name: Install clang-tidy
         run: sudo apt-get update && sudo apt-get install -y clang-tidy
@@ -76,10 +76,10 @@ jobs:
         include:
           - name: spdif
             target: esp32s3
-            sdkconfig: "sdkconfig.defaults;sdkconfig.defaults.esp32s3;sdkconfig.defaults.spdif"
+            sdkconfig: "config/sdkconfig.defaults;config/sdkconfig.defaults.esp32s3;config/sdkconfig.defaults.spdif"
           - name: usb
             target: esp32s3
-            sdkconfig: "sdkconfig.defaults;sdkconfig.defaults.esp32s3;sdkconfig.defaults.usb"
+            sdkconfig: "config/sdkconfig.defaults;config/sdkconfig.defaults.esp32s3;config/sdkconfig.defaults.usb"
     steps:
       - uses: actions/checkout@v6
         with:

@@ -43,7 +43,7 @@ idf.py -p /dev/ttyUSB0 monitor
 | `esparagus-louder-bt` | Louder + Bluetooth | |
 | `esparagus-louder-s3` | ESP32-S3 + Louder | |
 
-Sdkconfig defaults are layered via `cmake_extra_args` (left-to-right override). Custom board config: create `sdkconfig.user.<name>` + `user_platformio.ini` to extend any environment without modifying the main config.
+Board configs live in `config/` (the generated `sdkconfig` stays at the project root). Sdkconfig defaults are layered via `cmake_extra_args` (left-to-right override). Custom board config: create `config/sdkconfig.user.<name>` + `user_platformio.ini` to extend any environment without modifying the main config.
 
 ## Architecture
 
