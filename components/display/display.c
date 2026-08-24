@@ -232,6 +232,7 @@ static void send_dirty_rows(void) {
   const uint8_t tiles_h = u8g2_GetBufferTileHeight(&s_u8g2);
   const size_t row_bytes = (size_t)tiles_w * 8;
   const size_t total = row_bytes * tiles_h;
+  const uint32_t errors_before = u8g2_esp32_i2c_error_count();
 
   if (total > sizeof(s_shadow)) {
     u8g2_SendBuffer(&s_u8g2);
@@ -259,6 +260,14 @@ static void send_dirty_rows(void) {
       u8g2_UpdateDisplayArea(&s_u8g2, 0, first, tiles_w,
                              (uint8_t)(row - first));
     }
+  }
+
+  // A dropped transfer leaves the panel showing something other than what was
+  // sent, so keep the shadow invalid and repaint in full next frame rather
+  // than recording rows that never landed as clean.
+  if (u8g2_esp32_i2c_error_count() != errors_before) {
+    s_shadow_valid = false;
+    return;
   }
 
   memcpy(s_shadow, buf, total);
@@ -469,8 +478,11 @@ static void display_task(void *pvParameters) {
       // A plain delay would add each render to the frame period, tying the
       // scroll speed to I2C timing rather than to the clock.
       if (xTaskDelayUntil(&last_wake, scroll_interval) == pdFALSE) {
-        // Overran the frame. Yield regardless, or the loop never sleeps.
-        vTaskDelay(scroll_interval);
+        // Already past the deadline, so xTaskDelayUntil did not block. Yield
+        // the minimum to keep the loop from spinning, then restart the cadence
+        // from now; waiting out another whole interval would stall the scroll
+        // exactly when it is already behind.
+        vTaskDelay(1);
         last_wake = xTaskGetTickCount();
       }
       s_display.dirty = false;

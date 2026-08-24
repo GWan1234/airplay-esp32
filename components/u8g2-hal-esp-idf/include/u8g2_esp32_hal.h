@@ -101,6 +101,14 @@ void u8g2_esp32_hal_set_i2c_bus(i2c_master_bus_handle_t bus);
  */
 void u8g2_esp32_hal_set_spi_host(spi_host_device_t host);
 
+/**
+ * Number of I2C transfers that have failed since boot.
+ * The byte callback cannot report a failure back through u8g2, so a caller
+ * that caches what it has already sent needs this to tell that a transfer was
+ * dropped and its cache no longer matches the panel.
+ */
+uint32_t u8g2_esp32_i2c_error_count(void);
+
 uint8_t u8g2_esp32_spi_byte_cb(u8x8_t *u8x8, uint8_t msg, uint8_t arg_int,
                                void *arg_ptr);
 uint8_t u8g2_esp32_i2c_byte_cb(u8x8_t *u8x8, uint8_t msg, uint8_t arg_int,
